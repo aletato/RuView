@@ -21,3 +21,7 @@ fp16 = []
 [[example]]
 name = "init_random_blob"
 path = "examples/init_random_blob.rs"
+
+[[example]]
+name = "bench_speedup"
+path = "examples/bench_speedup.rs"
