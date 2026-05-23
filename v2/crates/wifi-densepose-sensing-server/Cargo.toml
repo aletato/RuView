@@ -50,6 +50,9 @@ wifi-densepose-wifiscan = { version = "0.3.0", path = "../wifi-densepose-wifisca
 # build without vcpkg/openblas (issue #366, #415).
 wifi-densepose-signal = { version = "0.3.0", path = "../wifi-densepose-signal", default-features = false }
 
+# Hardware crate — SyncPacket decoder for ADR-110 §A0.12 mesh-aligned timestamps.
+wifi-densepose-hardware = { version = "0.3.0", path = "../wifi-densepose-hardware" }
+
 # midstream — real-time introspection / low-latency tap (ADR-099 D1).
 # Two crates only, on purpose: scheduler / neural-solver / strange-loop are
 # explicitly out of scope of ADR-099 (D5).
