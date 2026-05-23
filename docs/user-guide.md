@@ -669,6 +669,7 @@ Field meanings:
 | `sequence` | u32 | High-water CSI sequence number stamped when this sync packet was emitted. Pair with the per-frame `sequence` field on incoming CSI to interpolate a mesh-aligned timestamp for any frame. |
 | `csi_fps_ema` | f64 | Per-node EMA of the observed CSI frame rate. Bench typical ≈ 10 Hz. |
 | `csi_fps_samples` | u32 | How many inter-frame deltas the EMA has seen. Treat values < 5 as "not yet trustworthy" and fall back to 20 Hz. |
+| `staleness_ms` | u64 (optional) | Milliseconds since the host last received a sync packet from this node ([iter 34](adr/ADR-110-esp32-c6-firmware-extension.md)). Fade UI badges after 5 000 ms; treat ≥ 9 000 ms as the same condition that the firmware's `c6_sync_espnow_is_valid()` reports as `false`. |
 
 **When `sync` is omitted entirely**: the node isn't on the mesh (or
 hasn't heard a peer yet). Non-ESP32 paths — multi-BSSID router scan,

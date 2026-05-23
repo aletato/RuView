@@ -325,6 +325,14 @@ struct NodeSyncSnapshot {
     /// How many CSI frames have contributed to `csi_fps_ema`. Clients can
     /// treat <5 as "not yet trustworthy" and fall back to 20 Hz.
     csi_fps_samples: u32,
+    /// ADR-110 iter 34 — milliseconds since the host last received a sync
+    /// packet from this node. Lets UI dashboards render sync-age decay
+    /// (badge fades after 5 s, drops off after the 9 s mesh_aligned_us
+    /// staleness gate). `None` only when the host never had Instant data
+    /// for this node, which shouldn't happen in normal flow but is
+    /// modeled defensively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staleness_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +592,7 @@ impl NodeState {
             sequence: sync.sequence,
             csi_fps_ema: self.csi_fps_ema,
             csi_fps_samples: self.csi_fps_samples,
+            staleness_ms: self.latest_sync_at.map(|t| t.elapsed().as_millis() as u64),
         })
     }
 
@@ -5789,6 +5798,7 @@ mod node_sync_snapshot_serialization_tests {
             sequence: 20,
             csi_fps_ema: 10.0,
             csi_fps_samples: 47,
+            staleness_ms: Some(120),
         }
     }
 
@@ -5807,9 +5817,10 @@ mod node_sync_snapshot_serialization_tests {
     fn sync_present_serializes_all_seven_fields() {
         let v = serde_json::to_value(sample_node(Some(sample_sync()))).unwrap();
         let s = v.get("sync").expect("sync key must be present");
-        // All seven contract fields named exactly as iter 23 documented.
+        // All eight contract fields named exactly as iter 23/34 documented.
         for key in ["offset_us", "is_leader", "is_valid", "smoothed",
-                    "sequence", "csi_fps_ema", "csi_fps_samples"] {
+                    "sequence", "csi_fps_ema", "csi_fps_samples",
+                    "staleness_ms"] {
             assert!(s.get(key).is_some(),
                     "sync object missing field `{}` — UI contract broken", key);
         }
@@ -5940,6 +5951,26 @@ mod sync_snapshot_helper_tests {
         assert_eq!(cur.sequence, 40);            // newer sequence persisted
         assert_eq!(cur.local_us, 30_000_000);    // newer local persisted
         assert_eq!(ns.latest_sync_at, Some(t1)); // staleness clock reset
+    }
+
+    #[test]
+    fn snapshot_staleness_ms_tracks_apply_time() {
+        // Iter 34: staleness_ms = (Instant::now() - latest_sync_at).as_millis().
+        // We can't pass a synthetic "now" through sync_snapshot, but we can
+        // pin latest_sync_at to a past instant and assert the value lands
+        // in a plausible window.
+        let mut ns = NodeState::new();
+        ns.latest_sync = Some(populated_sync(9));
+        ns.latest_sync_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(750));
+
+        let snap = ns.sync_snapshot().unwrap();
+        let st = snap.staleness_ms.expect("staleness_ms must be present");
+        // Should be approximately 750 ms — give a generous ±500 ms tolerance
+        // for any test-runner scheduling delay between checked_sub() and
+        // elapsed() within sync_snapshot.
+        assert!(st >= 740 && st < 1250,
+                "expected ~750 ms staleness, got {} ms", st);
     }
 
     #[test]
