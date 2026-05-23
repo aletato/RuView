@@ -149,6 +149,39 @@ impl SyncPacket {
         (local_at_frame_us as i64).wrapping_add(offset) as u64
     }
 
+    /// Recover the mesh-aligned timestamp for an in-flight CSI frame
+    /// **using its ADR-018 sequence number** as the timeline anchor.
+    ///
+    /// CSI frames carry no per-frame `local_us` field (ADR-018 v1 wire
+    /// format reserves no slot for it — see WITNESS-LOG-110 §A0.11),
+    /// but they do carry a 32-bit sequence number. The firmware emits
+    /// a sync packet alongside CSI frames, stamping the sequence
+    /// high-water observed at emit time into [`SyncPacket::sequence`].
+    ///
+    /// Given a frame's sequence and the node's observed CSI frame rate,
+    /// estimate the node-local time at the frame and apply the mesh
+    /// offset:
+    ///
+    /// ```text
+    ///   Δframes  = frame_seq - sync.sequence       (wrapping)
+    ///   Δus      = Δframes × 1_000_000 / fps_hz    (node-local)
+    ///   local_at = sync.local_us + Δus
+    ///   mesh     = local_at + (sync.epoch_us - sync.local_us)
+    /// ```
+    ///
+    /// `fps_hz` must be > 0; pass the firmware's `CSI_MIN_SEND_INTERVAL_US`
+    /// inverse (≈ 20 fps) or a measured rate from the broadcast-tick task.
+    /// The estimate is exact when the frame rate is stable (a node holding
+    /// 20 fps within ±1 frame for the sync→frame interval gives
+    /// |error| < 1/fps_hz ≈ 50 ms × the per-frame jitter ratio).
+    pub fn mesh_aligned_us_for_sequence(&self, frame_seq: u32, fps_hz: f64) -> u64 {
+        debug_assert!(fps_hz > 0.0, "fps_hz must be positive");
+        let dframes = (frame_seq.wrapping_sub(self.sequence)) as i64;
+        let dus = (dframes as f64 * 1_000_000.0 / fps_hz) as i64;
+        let local_at = (self.local_us as i64).wrapping_add(dus) as u64;
+        self.apply_to_local(local_at)
+    }
+
     /// Serialize back to wire bytes (32 bytes, little-endian).
     pub fn to_bytes(&self) -> [u8; SYNC_PACKET_SIZE] {
         let mut out = [0u8; SYNC_PACKET_SIZE];
@@ -307,6 +340,47 @@ mod tests {
         assert!((mesh as i64 - frame_local as i64).abs() <= 100,
                 "leader apply should be within 100 µs of identity, got {} delta",
                 mesh as i64 - frame_local as i64);
+    }
+
+    /// At the sync packet's own sequence number, the interpolated mesh
+    /// time must equal `epoch_us` exactly.
+    #[test]
+    fn mesh_aligned_for_sequence_identity_at_sync_point() {
+        let pkt = SyncPacket {
+            node_id: 9, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 28_798_450, epoch_us: 27_634_885, sequence: 20,
+        };
+        assert_eq!(pkt.mesh_aligned_us_for_sequence(20, 20.0), pkt.epoch_us);
+    }
+
+    /// 20 frames after the sync packet at 20 Hz → mesh time advances by 1 s,
+    /// preserving the leader/follower clock offset.
+    #[test]
+    fn mesh_aligned_for_sequence_extrapolates_forward() {
+        let pkt = SyncPacket {
+            node_id: 9, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 28_798_450, epoch_us: 27_634_885, sequence: 20,
+        };
+        // 20 frames at 20 fps = 1 000 000 µs
+        let mesh = pkt.mesh_aligned_us_for_sequence(40, 20.0);
+        assert_eq!(mesh, pkt.epoch_us + 1_000_000);
+    }
+
+    /// Sequence wraparound (u32 overflow) must extrapolate forward by one
+    /// frame, not jump backward by 2^32. The wrapping_sub semantics in
+    /// the implementation guard this.
+    #[test]
+    fn mesh_aligned_for_sequence_handles_seq_wraparound() {
+        let pkt = SyncPacket {
+            node_id: 9, proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 10_000, epoch_us: 10_000, sequence: u32::MAX,
+        };
+        // Next sequence after u32::MAX is 0 (wrap). Δframes = 1, not -2^32.
+        let mesh = pkt.mesh_aligned_us_for_sequence(0, 20.0);
+        assert_eq!(mesh, pkt.epoch_us + 50_000);  // 1 frame at 20 fps = 50 ms
     }
 
     #[test]

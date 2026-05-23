@@ -436,6 +436,23 @@ impl NodeState {
         Some(sync.apply_to_local(local_at_frame_us))
     }
 
+    /// ADR-110 §A0.12 sequence-based mesh-time recovery for an in-flight
+    /// ADR-018 CSI frame. The frame carries no `local_us` (the wire
+    /// format has no slot), but it carries a sequence number that the
+    /// sync packet's `sequence` high-water can be paired against. Uses
+    /// 20 Hz as the default CSI rate (the firmware's
+    /// `CSI_MIN_SEND_INTERVAL_US`-implied ceiling). Returns `None` if
+    /// no fresh sync has been observed for this node.
+    pub(crate) fn mesh_aligned_us_for_csi_frame(&self, frame_sequence: u32) -> Option<u64> {
+        let sync = self.latest_sync.as_ref()?;
+        let seen_at = self.latest_sync_at?;
+        if seen_at.elapsed() > std::time::Duration::from_secs(9) {
+            return None;
+        }
+        const CSI_FPS_HZ: f64 = 20.0;
+        Some(sync.mesh_aligned_us_for_sequence(frame_sequence, CSI_FPS_HZ))
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             frame_history: VecDeque::new(),
