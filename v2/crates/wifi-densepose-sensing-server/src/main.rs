@@ -5943,6 +5943,33 @@ mod sync_snapshot_helper_tests {
     }
 
     #[test]
+    fn mesh_aligned_us_honors_9s_staleness_gate() {
+        // The receive helper stores latest_sync_at = Instant::now() each
+        // beacon. mesh_aligned_us_for_csi_frame returns None once that
+        // Instant is older than 9 s (3 × VALID_WINDOW_MS). Verify both
+        // sides of that boundary without sleeping — set latest_sync_at
+        // to past instants directly.
+        let mut ns = NodeState::new();
+        let now = std::time::Instant::now();
+        ns.latest_sync = Some(populated_sync(9));
+
+        // Fresh: 1 s old → should return Some.
+        ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(1));
+        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_some(),
+                "1 s old sync must produce a mesh-aligned timestamp");
+
+        // Just inside the gate: 8 s old → should still return Some.
+        ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(8));
+        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_some(),
+                "8 s old sync must still be inside the 9 s gate");
+
+        // Just outside the gate: 10 s old → must return None.
+        ns.latest_sync_at = now.checked_sub(std::time::Duration::from_secs(10));
+        assert!(ns.mesh_aligned_us_for_csi_frame(20).is_none(),
+                "10 s old sync must trigger the 9 s staleness gate");
+    }
+
+    #[test]
     fn snapshot_reflects_leader_state() {
         // Same data shape that /api/v1/mesh emits for a leader node.
         let mut ns = NodeState::new();
