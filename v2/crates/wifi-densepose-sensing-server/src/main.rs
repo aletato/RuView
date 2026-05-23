@@ -553,6 +553,25 @@ impl NodeState {
     /// `udp_receiver_task`. Uses `last_frame_time` as the previous-frame
     /// anchor; the first frame after init seeds the timer without producing
     /// a sample (no prior dt to measure).
+    /// ADR-110 iter 30 — pure snapshot of this node's mesh-sync state.
+    /// Returns `None` when no sync packet has been observed. Used by both
+    /// the WebSocket broadcaster (iter 23) and the REST handlers (iter 29);
+    /// extracted here so tests can build a `NodeState`, populate
+    /// `latest_sync`, and assert the snapshot shape without spinning up
+    /// the axum router.
+    pub(crate) fn sync_snapshot(&self) -> Option<NodeSyncSnapshot> {
+        let sync = self.latest_sync.as_ref()?;
+        Some(NodeSyncSnapshot {
+            offset_us: sync.local_minus_epoch_us(),
+            is_leader: sync.flags.is_leader,
+            is_valid: sync.flags.is_valid,
+            smoothed: sync.flags.smoothed_used,
+            sequence: sync.sequence,
+            csi_fps_ema: self.csi_fps_ema,
+            csi_fps_samples: self.csi_fps_samples,
+        })
+    }
+
     pub(crate) fn observe_csi_frame_arrival(&mut self, now: std::time::Instant) {
         if let Some(prev) = self.last_frame_time {
             let dt = now.duration_since(prev).as_secs_f64();
@@ -4075,21 +4094,12 @@ async fn node_sync_endpoint(
             "error": "unknown_node", "node_id": id,
         })))
     })?;
-    let sync = ns.latest_sync.as_ref().ok_or_else(|| {
+    ns.sync_snapshot().map(Json).ok_or_else(|| {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": "no_sync", "node_id": id,
             "hint": "node hasn't emitted a sync packet yet (no mesh peer or not v0.6.9+)",
         })))
-    })?;
-    Ok(Json(NodeSyncSnapshot {
-        offset_us: sync.local_minus_epoch_us(),
-        is_leader: sync.flags.is_leader,
-        is_valid: sync.flags.is_valid,
-        smoothed: sync.flags.smoothed_used,
-        sequence: sync.sequence,
-        csi_fps_ema: ns.csi_fps_ema,
-        csi_fps_samples: ns.csi_fps_samples,
-    }))
+    })
 }
 
 /// ADR-110 iter 29 — fleet-wide mesh state via HTTP.
@@ -4102,16 +4112,7 @@ async fn mesh_endpoint(State(state): State<SharedState>) -> Json<serde_json::Val
     let s = state.read().await;
     let mut nodes = serde_json::Map::new();
     for (&id, ns) in s.node_states.iter() {
-        if let Some(sync) = ns.latest_sync.as_ref() {
-            let snap = NodeSyncSnapshot {
-                offset_us: sync.local_minus_epoch_us(),
-                is_leader: sync.flags.is_leader,
-                is_valid: sync.flags.is_valid,
-                smoothed: sync.flags.smoothed_used,
-                sequence: sync.sequence,
-                csi_fps_ema: ns.csi_fps_ema,
-                csi_fps_samples: ns.csi_fps_samples,
-            };
+        if let Some(snap) = ns.sync_snapshot() {
             nodes.insert(id.to_string(), serde_json::to_value(snap).unwrap());
         }
     }
@@ -4280,15 +4281,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
                             // if the node also speaks ESP-NOW.
-                            sync: n.latest_sync.as_ref().map(|s| NodeSyncSnapshot {
-                                offset_us: s.local_minus_epoch_us(),
-                                is_leader: s.flags.is_leader,
-                                is_valid: s.flags.is_valid,
-                                smoothed: s.flags.smoothed_used,
-                                sequence: s.sequence,
-                                csi_fps_ema: n.csi_fps_ema,
-                                csi_fps_samples: n.csi_fps_samples,
-                            }),
+                            sync: n.sync_snapshot(),
                         })
                         .collect();
 
@@ -4612,16 +4605,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                 .map(|a| a.iter().take(56).cloned().collect())
                                 .unwrap_or_default(),
                             subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
-                            // ADR-110 iter 23: snapshot the latest mesh sync.
-                            sync: n.latest_sync.as_ref().map(|s| NodeSyncSnapshot {
-                                offset_us: s.local_minus_epoch_us(),
-                                is_leader: s.flags.is_leader,
-                                is_valid: s.flags.is_valid,
-                                smoothed: s.flags.smoothed_used,
-                                sequence: s.sequence,
-                                csi_fps_ema: n.csi_fps_ema,
-                                csi_fps_samples: n.csi_fps_samples,
-                            }),
+                            // ADR-110 iter 23 / iter 30 — single source of truth.
+                            sync: n.sync_snapshot(),
                         })
                         .collect();
 
@@ -5848,6 +5833,73 @@ mod node_sync_snapshot_serialization_tests {
         assert_eq!(s_parsed.sequence, s_orig.sequence);
         assert!((s_parsed.csi_fps_ema - s_orig.csi_fps_ema).abs() < 1e-9);
         assert_eq!(s_parsed.csi_fps_samples, s_orig.csi_fps_samples);
+    }
+}
+
+#[cfg(test)]
+mod sync_snapshot_helper_tests {
+    //! ADR-110 iter 30 — covers the pure helper that backs both
+    //! `/api/v1/nodes/:id/sync` and `/api/v1/mesh` REST endpoints and
+    //! the WebSocket sensing_update broadcast. Tests at this layer keep
+    //! the public-API contract honest without spinning up the axum
+    //! router or constructing a full AppStateInner.
+
+    use super::*;
+    use wifi_densepose_hardware::{SyncPacket, SyncPacketFlags};
+
+    fn populated_sync(node_id: u8) -> SyncPacket {
+        SyncPacket {
+            node_id,
+            proto_ver: 1,
+            flags: SyncPacketFlags { is_leader: false, is_valid: true, smoothed_used: true },
+            local_us: 28_798_450,
+            epoch_us: 27_634_885,
+            sequence: 20,
+        }
+    }
+
+    #[test]
+    fn fresh_node_with_no_sync_returns_none() {
+        // Mirrors the REST 404 "no_sync" branch.
+        let ns = NodeState::new();
+        assert!(ns.sync_snapshot().is_none());
+    }
+
+    #[test]
+    fn node_with_latest_sync_produces_correct_snapshot() {
+        // Mirrors the REST 200 OK branch + the WebSocket sync field.
+        let mut ns = NodeState::new();
+        ns.latest_sync = Some(populated_sync(9));
+        ns.latest_sync_at = Some(std::time::Instant::now());
+        // Pretend the fps EMA has settled (iter 18 5-sample warmup).
+        ns.csi_fps_ema = 10.5;
+        ns.csi_fps_samples = 42;
+
+        let snap = ns.sync_snapshot().expect("populated state must produce a snapshot");
+        assert_eq!(snap.offset_us, 1_163_565);  // §A0.10 measured boot delta
+        assert!(!snap.is_leader);
+        assert!(snap.is_valid);
+        assert!(snap.smoothed);
+        assert_eq!(snap.sequence, 20);
+        assert!((snap.csi_fps_ema - 10.5).abs() < 1e-9);
+        assert_eq!(snap.csi_fps_samples, 42);
+    }
+
+    #[test]
+    fn snapshot_reflects_leader_state() {
+        // Same data shape that /api/v1/mesh emits for a leader node.
+        let mut ns = NodeState::new();
+        let mut s = populated_sync(12);
+        s.flags = SyncPacketFlags { is_leader: true, is_valid: true, smoothed_used: false };
+        s.local_us = 28_864_932;
+        s.epoch_us = 28_864_939;  // -7 µs delta on the leader
+        ns.latest_sync = Some(s);
+        ns.latest_sync_at = Some(std::time::Instant::now());
+
+        let snap = ns.sync_snapshot().unwrap();
+        assert!(snap.is_leader);
+        assert_eq!(snap.offset_us, -7);  // call-stack µs only
+        assert!(!snap.smoothed);
     }
 }
 
