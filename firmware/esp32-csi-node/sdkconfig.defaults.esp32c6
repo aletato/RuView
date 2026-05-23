@@ -28,17 +28,22 @@ CONFIG_ESP_WIFI_CSI_ENABLED=y
 # on chips that have HE support (C6/C5). WPA3 is opt-in:
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
 
-# ── ADR-110 P4: 802.15.4 + OpenThread (MTD) ──
-# IEEE 802.15.4 PHY + OpenThread Minimal Thread Device for mesh time-sync.
-# MTD is lighter than FTD (no router/leader code) — perfect for sensor nodes.
+# ── ADR-110 P4: 802.15.4 (raw, no OpenThread) ──
+# IEEE 802.15.4 PHY enabled for our raw beacon protocol in c6_timesync.c.
+# OpenThread is DISABLED — empirically (ch15 + ch26 tested with the same
+# negative result), enabling OpenThread MTD caused our weak-symbol overrides
+# of esp_ieee802154_receive_done/transmit_done to never fire, breaking
+# leader election. Raw 802.15.4 mode is what we actually need: a private
+# mesh protocol on a private channel, no Thread network attach.
 CONFIG_IEEE802154_ENABLED=y
-CONFIG_OPENTHREAD_ENABLED=y
-CONFIG_OPENTHREAD_MTD=y
-CONFIG_OPENTHREAD_FTD=n
-CONFIG_OPENTHREAD_RADIO=n
-# Disable joiner / commissioner — we use a pre-shared network key in NVS.
-CONFIG_OPENTHREAD_JOINER=n
-CONFIG_OPENTHREAD_COMMISSIONER=n
+CONFIG_OPENTHREAD_ENABLED=n
+
+# ADR-110 P4: 802.15.4 channel override.
+# Default Kconfig value is 15 (2425 MHz). On the 2.4 GHz radio that's
+# directly under WiFi channel 5 (2432 MHz). Channel 26 = 2480 MHz is on
+# the WiFi guard band above channel 14, giving the 15.4 path room to RX
+# without competing with WiFi traffic for radio time.
+CONFIG_C6_TIMESYNC_CHANNEL=26
 
 # ── ADR-110 P5: LP-core (deep-sleep coprocessor) ──
 # Enable the LP RISC-V core so c6_lp_core.c can ship a wake-on-motion stub.

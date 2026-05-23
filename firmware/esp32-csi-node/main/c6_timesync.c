@@ -74,6 +74,11 @@ static uint64_t eui64_bytes_to_u64(const uint8_t eui[8])
            ((uint64_t)eui[6] << 8 ) |  (uint64_t)eui[7];
 }
 
+static uint32_t s_tx_count = 0;
+static uint32_t s_tx_fail  = 0;
+static uint32_t s_rx_count = 0;
+static uint32_t s_rx_magic_match = 0;
+
 static void send_beacon(void)
 {
     uint8_t frame[32];
@@ -95,11 +100,30 @@ static void send_beacon(void)
     uint8_t tx_buf[64];
     tx_buf[0] = (uint8_t)(total + 2);  /* +2 for FCS appended by HW */
     memcpy(&tx_buf[1], frame, total);
-    esp_ieee802154_transmit(tx_buf, false);
+    esp_err_t r = esp_ieee802154_transmit(tx_buf, false);
+    s_tx_count++;
+    if (r != ESP_OK) s_tx_fail++;
+    /* Diag log every 10 beacons. */
+    if ((s_tx_count % 10) == 1) {
+        ESP_LOGI(TAG, "tx#%lu (fail=%lu) rx#%lu (magic_match=%lu) is_leader=%d",
+                 (unsigned long)s_tx_count, (unsigned long)s_tx_fail,
+                 (unsigned long)s_rx_count, (unsigned long)s_rx_magic_match,
+                 (int)s_is_leader);
+    }
 }
 
+/* KNOWN ISSUE (see WITNESS-LOG-110 §D1 / task #30):
+ * Empirically observed on 3 C6 boards with channel=26, OpenThread disabled,
+ * promiscuous=true, and IDF v5.4 reference RX/TX callback pattern: only 1
+ * RX event ever fires after init, despite ~381 successful TX events from
+ * the other boards in the same 38-second window. Manual re-arm with
+ * esp_ieee802154_receive() in either callback context bootloops the
+ * driver. Hypothesis: half-duplex radio + driver state-machine issue;
+ * needs an IDF maintainer trace or a working multi-board reference.
+ * Cross-node sync claim (ADR-110 §B3) is BLOCKED on this. */
 void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
 {
+    s_rx_count++;
     /* PHY length is frame[0]; payload starts at frame[1]. */
     if (frame == NULL || frame[0] < (9 + sizeof(ts_beacon_t) + 2)) {
         if (frame) esp_ieee802154_receive_handle_done(frame);
@@ -110,6 +134,7 @@ void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *fr
         esp_ieee802154_receive_handle_done(frame);
         return;
     }
+    s_rx_magic_match++;
     uint64_t now = (uint64_t)esp_timer_get_time();
     if (b->leader_flag) {
         /* Adopt this leader if its EUI is lower than ours (or unknown). */
@@ -124,6 +149,9 @@ void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *fr
             }
         }
     }
+    /* handle_done auto-restarts RX in the IDF driver; calling
+     * esp_ieee802154_receive() here would double-arm and panic
+     * (verified empirically — 25 reboot loops observed). */
     esp_ieee802154_receive_handle_done(frame);
 }
 
@@ -132,6 +160,9 @@ void esp_ieee802154_transmit_done(const uint8_t *frame,
                                   esp_ieee802154_frame_info_t *ack_frame_info)
 {
     (void)frame; (void)ack; (void)ack_frame_info;
+    /* Note: do NOT call esp_ieee802154_receive() here — it panics the
+     * driver (verified empirically, all 3 boards bootloop). The IDF
+     * driver internally manages RX/TX state transitions. */
 }
 
 void esp_ieee802154_transmit_failed(const uint8_t *frame, esp_ieee802154_tx_error_t error)
@@ -184,7 +215,10 @@ esp_err_t c6_timesync_init(uint8_t channel)
         ESP_LOGE(TAG, "ieee802154_enable failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    esp_ieee802154_set_promiscuous(false);
+    /* promiscuous=true so we accept broadcast frames addressed to 0xFFFF.
+     * In non-promiscuous mode the radio filters to frames addressed to
+     * our short or extended address. Our beacon protocol uses broadcast. */
+    esp_ieee802154_set_promiscuous(true);
     esp_ieee802154_set_panid(0xCAFE);
     esp_ieee802154_set_short_address(0x0000);
     esp_ieee802154_set_extended_address(mac);
