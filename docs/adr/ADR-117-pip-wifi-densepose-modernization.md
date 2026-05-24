@@ -356,6 +356,110 @@ async with SensingClient("ws://localhost:8765/ws/sensing") as client:
 Both clients are **pure Python** (no PyO3) and are optional dependencies (`pip install
 wifi-densepose[client]`). They depend on `websockets>=12` and `paho-mqtt>=2` respectively.
 
+### 5.7a Beamforming Feedback Loop Data (BFLD) support — new binding target
+
+**Added 2026-05-24 per maintainer feedback during P3 implementation.**
+
+BFLD is the transmitter-side, AP-station-loop view of the WiFi channel
+— compressed beamforming feedback frames that 802.11ac/ax/be stations
+send to the AP per sounding cycle. From a sensing perspective it
+complements receiver-side CSI:
+
+| | Receiver-side CSI (current) | BFLD (this addition) |
+|---|---|---|
+| Source | RX side of the radio (e.g. Nexmon CSI on Pi 5, ESP32 promisc cb) | Sniffed BFR frames in the air or `mac80211` ACK trace |
+| Subcarriers (HE20) | 52 (HT-LTF) or 242 (HE-LTF) | Up to 996 (HE160 compressed BFR) — denser |
+| Hardware requirements | Patched Broadcom/Cypress or ESP32 specifically | **Any** 802.11ac+ station-AP pair — no patched firmware |
+| Privacy model | Captures everyone in radio range | Same |
+| Maturity in repo | Production (ADR-014, ADR-018, ADR-039) | Research; no Rust crate yet |
+| Suitable use case | Through-wall pose + vitals | Dense subcarrier reflection profile for AETHER-class biometric (ADR-024) and the soul-signature spec (`docs/research/soul/`) |
+
+#### Binding strategy
+
+Because the Rust workspace has no `wifi-densepose-bfld` crate yet, P3
+ships a **forward-compatible Python trait surface** that the future
+Rust crate plugs into without changing the Python API:
+
+```python
+from wifi_densepose import BfldFrame, BfldReport
+
+# Today (P3): construct from a parsed BFR feedback matrix (the bring-
+# your-own-parser path). Users on Pi 5 + Wireshark BFR dissector
+# pipe frames in directly.
+frame = BfldFrame.from_compressed_feedback(
+    timestamp_ms=…,
+    sounding_index=…,
+    sta_mac="aa:bb:cc:…",
+    bandwidth_mhz=80,
+    n_subcarriers=996,
+    feedback_matrix=…,  # numpy ndarray complex64 [Nr × Nc × Nsc]
+)
+
+# P3 also ships a stub `BfldReport` aggregator that mirrors how
+# `VitalEstimate` aggregates `VitalReading`s. Users who have BFR
+# pipelines feeding RuView can use this today via the
+# bring-your-own-parser path.
+
+# Tomorrow (post-v2.0): the `wifi-densepose-bfld` Rust crate (TBD —
+# separate ADR-1xx) provides ingestion from Nexmon `nl80211` traces +
+# kernel `mac80211` debugfs hooks, and the pip wheel transparently
+# binds it without changing this Python surface.
+```
+
+#### Why this matters
+
+Three reasons BFLD belongs in v2.0 rather than waiting for the Rust
+core:
+
+1. **Customer pull**. Several integrators reading the ADR-115 release
+   notes asked about WiFi-6 dense-subcarrier capture; the answer is
+   BFLD, and we want the API stable before they build pipelines.
+2. **Soul-signature dependency**. The soul-signature research spec
+   (`docs/research/soul/specification.md`) lists "Subcarrier Reflection
+   Profile" as one of seven biometric channels. At HE20/HE80 the
+   dense BFR subcarriers are the right input — exposing `BfldFrame`
+   now lets researchers prototype the channel without waiting on a
+   Rust ingestion crate.
+3. **Cross-vendor portability**. CSI ingestion needs patched
+   firmware. BFR ingestion works on stock 802.11ac/ax hardware
+   (capture via `tcpdump`/Wireshark + a BFR dissector). Shipping the
+   Python data structures first gives the community a way to feed
+   RuView from gear we don't directly support.
+
+#### Implementation surface in P3
+
+Lands as a new module `bindings/bfld.rs` (~150 lines, three
+`#[pyclass]` types):
+
+- `BfldFrame` (frozen) — one compressed feedback matrix snapshot.
+  Constructors: `from_compressed_feedback(...)` and
+  `from_uncompressed_v(...)` (the 802.11n V-matrix form).
+  Properties: `timestamp_ms`, `sounding_index`, `sta_mac`,
+  `bandwidth_mhz`, `n_subcarriers`, `n_rows` (Nr), `n_cols` (Nc),
+  `feedback_matrix` (numpy ndarray complex64).
+- `BfldReport` (frozen) — aggregator over a window of `BfldFrame`s.
+  Properties: `n_frames`, `timestamp_first`, `timestamp_last`,
+  `mean_amplitude_per_subcarrier`, `coherence_score`. The Python
+  side gives users a stable handle for "all BFR data in this 60-s
+  scan" without leaking the storage representation.
+- `BfldKind` (`#[pyclass(eq, eq_int, hash, frozen)]`) — enum
+  enumerating the BFR variants we support: `CompressedHE20`,
+  `CompressedHE40`, `CompressedHE80`, `CompressedHE160`,
+  `UncompressedHT20`, `UncompressedHT40`.
+
+Stub Rust implementation lives in `python/src/bfld_stub.rs` until
+the proper Rust crate exists; it's intentionally not in v2/crates/.
+A new ADR-1xx will own the Rust ingestion crate when we commit to it.
+
+#### Open questions added
+
+- §9.11 — Should BFLD ingestion live in a new `wifi-densepose-bfld`
+  crate or in `wifi-densepose-signal` extended?
+- §9.12 — Per-vendor BFR variant compatibility (Broadcom vs Intel vs
+  Qualcomm encode the compressed angles slightly differently) — how
+  much normalisation belongs in the Python binding vs. the future
+  Rust crate?
+
 ### 5.7 Witness chain (re-rooted to the Rust pipeline)
 
 `wifi_densepose.witness.verify_bundle(path)` replaces the v1 proof verification with a
@@ -444,8 +548,36 @@ scaffold  core   vitals+   client   publish  deferred
 - [ ] Announce: `wifi-densepose==1.99.0` tombstone already on PyPI; `v2.0.0` replaces
   it in search results.
 
+### P3.5 — BFLD binding surface (concurrent with P3)
+
+**Added 2026-05-24 per maintainer feedback.** See §5.7a for the rationale.
+
+- [ ] `python/src/bindings/bfld.rs` — `BfldFrame`, `BfldReport`,
+  `BfldKind` `#[pyclass]` wrappers backed by a stub Rust impl
+  pending the v3 `wifi-densepose-bfld` crate.
+- [ ] `python/src/bfld_stub.rs` — minimal in-crate stub storage
+  (vec of compressed feedback matrices) so the Python API is
+  fully usable today even before the Rust ingestion crate lands.
+- [ ] Numpy bridge for `feedback_matrix` (Complex64 ndarray) — same
+  approach as `CsiFrame.amplitude` from P3.
+- [ ] Tests covering: per-bandwidth constructor paths
+  (HE20/HE40/HE80/HE160 + HT20/HT40), n_subcarriers contract,
+  coherence_score sanity, BfldKind hashability + equality.
+- [ ] Forward-compat contract test: `BfldFrame` constructed today
+  from a numpy ndarray must round-trip through (de)serialisation
+  identically once the Rust crate exists.
+- [ ] §9.11 + §9.12 open questions raised so the eventual Rust crate
+  has clear decisions waiting for it.
+
+P3.5 is concurrent with P3 (no new schedule cushion needed) because
+the Python surface is independent of the rest of the v2/ workspace.
+Land in the same wheel as P3.
+
 ### P6+ — Deferred
 
+- [ ] `wifi-densepose-bfld` Rust crate — proper ingestion from
+  Nexmon BFR pcaps + `mac80211` debugfs. Replaces the P3.5 stub
+  storage without changing the Python API. Owns its own ADR-1xx.
 - [ ] `wifi-densepose-nn` bindings (libtorch / candle wheel size TBD — see Open
   Questions §13.3).
 - [ ] `wifi-densepose-ruvector` bindings (RuVector attention types).
@@ -625,9 +757,40 @@ The following checks must all pass before ADR-117 is considered Accepted:
     *Tentative: read-only for v2.0. Write path deferred to the HACS integration follow-on
     (ADR-115 §6.A).*
 
+11. **BFLD Rust crate ownership** (added 2026-05-24): the P3.5 BFLD bindings ship with a
+    stub Rust impl in `python/src/bfld_stub.rs`. The proper Rust crate (Nexmon BFR pcap
+    parser + `mac80211` debugfs ingestor) will land later. Should it be a new
+    `wifi-densepose-bfld` workspace member, or should it extend `wifi-densepose-signal`?
+    *Tentative: new dedicated crate. Reasons: (a) the BFR parser is significant code
+    (Wireshark's dissector is ~2k lines) and bloats `-signal`; (b) BFLD ingestion is
+    optional — many deployments will only use CSI; gating behind a separate crate keeps
+    the default `-signal` lean. Decide before committing to the crate name in any
+    `pyproject.toml` extras.*
+
+12. **BFLD per-vendor compressed-angle variants** (added 2026-05-24): 802.11 standardizes
+    the compressed beamforming feedback format but vendors (Broadcom, Intel, Qualcomm,
+    MediaTek) differ in psi/phi quantization step + ordering of consecutive matrix
+    entries. How much normalisation belongs in the Python `BfldFrame.from_compressed_feedback`
+    binding vs. the future Rust crate? *Tentative: Python binding is dumb (numpy ndarray
+    in, numpy ndarray out — no decoding); the future Rust crate owns per-vendor
+    normalisation, exposed via a `Vendor` enum on the binding constructor. Confirm via
+    a per-vendor test fixture before P3.5 ships.*
+
 ---
 
 ## 12. References
+
+### BFLD references (added 2026-05-24 for §5.7a + §11.11 + §11.12)
+
+- Hernandez & Bulut, *"Wi-Fi Sensing With Compressed Beamforming Feedback"*, ACM TOSN 2024 — first systematic survey of BFR-as-sensing
+- Yousefi, Soltanaghaei & Bharadia, *"Just-In-Time Wi-Fi Sensing Using Compressed Beamforming Feedback"*, MobiSys 2023 — practical pipeline for breath + heart-rate extraction from sniffed BFR
+- IEEE 802.11ax-2021 §27.3.10 — Compressed Beamforming Feedback frame format
+- Wireshark BFR dissector — `packet-ieee80211.c` reference implementation
+- AX210 Linux mac80211 debugfs BFR capture path (kernel 6.10+)
+- Sample BFR-vs-CSI parity dataset — TBD; we'll publish one alongside the
+  `wifi-densepose-bfld` crate when it lands
+
+### Original references
 
 - **PyPI package (current)**: https://pypi.org/project/wifi-densepose/ — v1.1.0, released 2025-06-07
 - **PyPI JSON metadata**: https://pypi.org/pypi/wifi-densepose/json
