@@ -48,7 +48,13 @@ fn hello() -> PyResult<&'static str> {
 /// package (`import wifi_densepose`) and never reach into `_native`
 /// directly; the leading underscore is a Python convention marking
 /// it as private.
+///
+/// The function name MUST match the `module-name` in pyproject.toml's
+/// `[tool.maturin]` block — i.e. it must be `_native` because the
+/// pyproject says `module-name = "wifi_densepose._native"`. PyO3
+/// generates the `PyInit__native` symbol from this function name.
 #[pymodule]
+#[pyo3(name = "_native")]
 fn wifi_densepose_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__rust_version__", RUST_CORE_VERSION)?;
     m.add("__rust_build_tag__", RUST_BUILD_TAG)?;

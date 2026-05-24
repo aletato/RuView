@@ -69,9 +69,11 @@ Documentation = "https://github.com/ruvnet/RuView/tree/main/docs"
 # wifi-densepose = "wifi_densepose.cli:main"
 
 [tool.maturin]
-# Layout: ./python/ holds the Rust crate + Python facade; the wheel
-# packs `wifi_densepose/` as the top-level package.
-python-source = "python"
+# Layout: pyproject.toml + Cargo.toml live at `python/`; the
+# python-source directory `wifi_densepose/` is a sibling (i.e. at
+# `python/wifi_densepose/`). `python-source = "."` tells maturin to
+# look for packages directly under the project root.
+python-source = "."
 module-name = "wifi_densepose._native"
 features = ["pyo3/extension-module"]
 # Strip debug symbols for smaller release wheels (ADR-117 §5.4 5 MB budget).

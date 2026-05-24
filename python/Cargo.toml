@@ -1,11 +1,16 @@
 [package]
 name = "wifi-densepose-py"
 version = "2.0.0-alpha.1"
-edition.workspace = true
-license.workspace = true
+# The `python/` crate is intentionally OUTSIDE the `v2/` Cargo
+# workspace (ADR-117 §5.2) so maturin's `python-source` + `module-name`
+# config stays self-contained and `cargo test --workspace` in v2/
+# doesn't have to compile pyo3. Hence no `*.workspace = true`
+# inheritance here — every field is local.
+edition = "2021"
+license = "MIT"
 authors = ["rUv <ruv@ruv.net>", "WiFi-DensePose Contributors"]
 description = "PyO3 bindings for the WiFi-DensePose Rust core — ships as the `wifi-densepose` PyPI wheel (ADR-117)"
-repository.workspace = true
+repository = "https://github.com/ruvnet/RuView"
 
 # ADR-117 §5.2: the Python wheel's compiled module name is
 # `wifi_densepose._native` (the leading underscore marks it as an internal
