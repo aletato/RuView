@@ -73,6 +73,27 @@ pub struct CalibrateServeArgs {
     /// Directory where finalized baseline `.bin` files are written.
     #[arg(long, default_value = "./baselines")]
     pub output_dir: String,
+
+    /// Require `Authorization: Bearer <token>` on every API request. Strongly
+    /// recommended before binding to anything other than 127.0.0.1.
+    #[arg(long, env = "CALIBRATE_TOKEN")]
+    pub token: Option<String>,
+}
+
+/// Sanitize a client-supplied `room_id` for use in a filename (defends the
+/// baseline write path against `../` / absolute-path traversal). Keeps only
+/// `[A-Za-z0-9_-]`; empty result falls back to `default`.
+fn sanitize_room_id(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "default".into()
+    } else {
+        cleaned
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +180,32 @@ struct ApiState {
     status: Arc<RwLock<SharedStatus>>,
 }
 
+/// Bearer-token gate (applied only when `--token` is set). Constant-time-ish
+/// compare is unnecessary here (local appliance), but reject anything that
+/// isn't an exact `Bearer <token>` match.
+async fn require_bearer(
+    axum::extract::State(token): axum::extract::State<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let authorized = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|t| t == token)
+        .unwrap_or(false);
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing or invalid bearer token"})),
+        )
+            .into_response()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -194,7 +241,7 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     }
 
     let state = ApiState { cmd_tx, status };
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(descriptor))
         .route("/api/v1/calibration/health", get(health))
         .route("/api/v1/calibration/start", post(start))
@@ -204,6 +251,17 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         .route("/api/v1/calibration/baselines", get(baselines))
         .layer(CorsLayer::permissive())
         .with_state(state);
+
+    // Optional bearer auth — required before any non-loopback exposure.
+    if let Some(token) = args.token.clone() {
+        app = app.layer(axum::middleware::from_fn_with_state(token, require_bearer));
+        eprintln!("[calibrate-serve] bearer auth ENABLED");
+    } else if args.http_bind != "127.0.0.1" && args.http_bind != "localhost" {
+        eprintln!(
+            "[calibrate-serve] WARNING: bound to {} with NO --token — anyone on the network can drive calibration",
+            args.http_bind
+        );
+    }
 
     let http_addr = format!("{}:{}", args.http_bind, args.http_port);
     let listener = tokio::net::TcpListener::bind(&http_addr)
@@ -243,6 +301,10 @@ async fn ingest_loop(
     let mut buf = vec![0u8; RECV_BUF];
     let mut active: Option<ActiveSession> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    // Counters mirrored to shared status only on the 200 ms tick — avoids a lock
+    // + SessionStatus clone on every UDP frame (CPU starvation under flood).
+    let mut frames_seen: u64 = 0;
+    let mut last_frame_ms: u64 = 0;
 
     loop {
         tokio::select! {
@@ -264,7 +326,8 @@ async fn ingest_loop(
                     }
                     let target_frames = config.min_frames as usize;
                     let dur = params.duration_s.max(1) as u64;
-                    let room_id = params.room_id.unwrap_or_else(|| "default".into());
+                    // Sanitize: room_id is interpolated into the baseline write path.
+                    let room_id = sanitize_room_id(&params.room_id.unwrap_or_else(|| "default".into()));
                     let sess = ActiveSession {
                         recorder: CalibrationRecorder::new(config),
                         room_id: room_id.clone(),
@@ -297,14 +360,10 @@ async fn ingest_loop(
                 }
             },
 
-            // --- incoming CSI frame ---
+            // --- incoming CSI frame (no shared-status lock here; flushed on tick) ---
             Ok(n) = socket.recv(&mut buf) => {
-                let now_ms = unix_ms();
-                {
-                    let mut s = status.write().await;
-                    s.frames_seen += 1;
-                    s.last_frame_unix_ms = now_ms;
-                }
+                frames_seen += 1;
+                last_frame_ms = unix_ms();
                 if let Some(sess) = active.as_mut() {
                     let tier = sess.tier.clone();
                     if let Some(frame) = parse_csi_packet(&buf[..n], &tier) {
@@ -313,10 +372,7 @@ async fn ingest_loop(
                             sess.z_max = score.amplitude_z_max;
                             sess.motion_flagged = score.motion_flagged;
                         }
-                        let frames = sess.recorder.frames_recorded() as usize;
-                        let snap = session_snapshot(sess, "recording", None);
-                        status.write().await.session = Some(snap);
-                        if frames >= sess.target_frames {
+                        if sess.recorder.frames_recorded() as usize >= sess.target_frames {
                             if let Some(done) = active.take() {
                                 let _ = finalize(done, &output_dir, &status).await;
                             }
@@ -325,8 +381,16 @@ async fn ingest_loop(
                 }
             },
 
-            // --- periodic deadline check (fires even if frames stop arriving) ---
+            // --- 200 ms tick: flush counters + session snapshot, deadline check ---
             _ = tick.tick() => {
+                {
+                    let mut s = status.write().await;
+                    s.frames_seen = frames_seen;
+                    s.last_frame_unix_ms = last_frame_ms;
+                    if let Some(sess) = active.as_ref() {
+                        s.session = Some(session_snapshot(sess, "recording", None));
+                    }
+                }
                 if let Some(sess) = active.as_ref() {
                     if Instant::now() >= sess.deadline {
                         let frames = sess.recorder.frames_recorded() as usize;
@@ -376,7 +440,10 @@ async fn finalize(
     let uuid = baseline.calibration_uuid().to_string();
     let path = format!("{output_dir}/{room_id}-{uuid}.bin");
     let bytes = baseline.to_bytes();
-    std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+    // Async write — never block the ingest task's UDP/command path.
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("cannot write {path}: {e}"))?;
 
     let summary = ResultSummary {
         calibration_id: uuid,
@@ -588,8 +655,19 @@ mod tests {
             udp_bind: "0.0.0.0".into(),
             tier: "ht20".into(),
             output_dir: "./baselines".into(),
+            token: None,
         };
         assert_eq!(a.http_port, 8090);
         assert_eq!(a.udp_port, 5005);
+    }
+
+    #[test]
+    fn sanitize_blocks_path_traversal() {
+        assert_eq!(sanitize_room_id("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_room_id("/abs/path"), "abspath");
+        assert_eq!(sanitize_room_id("living-room_1"), "living-room_1");
+        assert_eq!(sanitize_room_id(""), "default");
+        assert_eq!(sanitize_room_id("..\\..\\win"), "win");
+        assert!(!sanitize_room_id("a/b/c").contains('/'));
     }
 }

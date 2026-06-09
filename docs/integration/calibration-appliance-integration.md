@@ -170,7 +170,16 @@ Pure Rust; deps are `wifi-densepose-core` + `wifi-densepose-signal` (default-fea
 Verified on `cognitum-v0`: aarch64, `cargo 1.96.0`, Hailo `HAILO10H`, `ruview-vitals-worker:50054`.
 
 **Step 1 — vendor / depend on the crate.** Add `wifi-densepose-calibration` (path or published crate)
-to the appliance workspace. It builds natively (aarch64, no BLAS/GPU).
+to the appliance workspace. It builds natively on aarch64 — no BLAS/GPU, **and no ONNX/OpenSSL**:
+the CLI's `mat`→`nn`→`ort`(ONNX)→`openssl-sys` chain is now feature-gated out of the calibration build.
+
+```bash
+# Pi/appliance calibration binary — cross-compiles clean (no ort/openssl):
+cargo build -p wifi-densepose-cli --no-default-features --release
+#   (omit `--no-default-features` only if you also need the MAT subcommands)
+```
+Verified: `cargo tree -p wifi-densepose-cli --no-default-features` shows **0** `ort`/`openssl-sys` deps;
+`cross test --target aarch64-unknown-linux-gnu` passes the calibration suite under qemu.
 
 **Step 2 — wire the CSI source.** Two options:
   - (a) Tee the ESP32 UDP stream the vitals worker already receives into the calibration ingest, or
@@ -191,8 +200,13 @@ head to Hailo HEF, serve via `ruvector-hailo-worker:50051`; the small specialist
 embedding. This is the ADR-150 follow-on — *not required* for the calibration service to run.
 
 **Privacy / security:** keep baselines + banks local; if federating across appliances (ADR-105),
-exchange bank/model deltas, never raw CSI. `calibrate-serve` CORS is permissive for dev — bind to
-loopback and gate via the appliance proxy in production.
+exchange bank/model deltas, never raw CSI. Hardening already in place:
+- **`--token <T>`** (or `CALIBRATE_TOKEN` env) requires `Authorization: Bearer <T>` on every route; the
+  server warns loudly if bound to a non-loopback address without a token.
+- **`room_id` is sanitized** to `[A-Za-z0-9_-]` (≤64 chars) before it touches the baseline write path —
+  no `../` / absolute-path traversal.
+- CORS is permissive for dev — in production bind to loopback and reverse-proxy through the appliance
+  gateway (which already enforces bearer auth).
 
 ---
 

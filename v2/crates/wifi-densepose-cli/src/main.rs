@@ -36,11 +36,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::RoomWatch(args) => {
             wifi_densepose_cli::room::room_watch(args).await?;
         }
+        #[cfg(feature = "mat")]
         Commands::Mat(mat_cmd) => {
             wifi_densepose_cli::mat::execute(mat_cmd).await?;
         }
         Commands::Version => {
             println!("wifi-densepose {}", env!("CARGO_PKG_VERSION"));
+            #[cfg(feature = "mat")]
             println!("MAT module version: {}", wifi_densepose_mat::VERSION);
         }
     }

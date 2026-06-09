@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 pub mod calibrate;
 pub mod calibrate_api;
 pub mod room;
+#[cfg(feature = "mat")]
 pub mod mat;
 
 /// WiFi-DensePose Command Line Interface
@@ -73,6 +74,7 @@ pub enum Commands {
     RoomWatch(room::RoomWatchArgs),
 
     /// Mass Casualty Assessment Tool commands
+    #[cfg(feature = "mat")]
     #[command(subcommand)]
     Mat(mat::MatCommand),
 
