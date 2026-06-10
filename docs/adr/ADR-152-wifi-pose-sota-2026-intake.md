@@ -54,6 +54,8 @@ Adopt four changes, ordered by effort-vs-gain:
 
 Pull the Apache-2.0 weights + 360k-sample dataset; run three measurements: (a) their model on their data (reproduce 97.25% claim), (b) their model fine-tuned on our ESP32 17-keypoint eval set, (c) our internal WiFlow on their dataset (15-keypoint subset mapping). Until (a)–(c) are measured, **no RuView doc may cite 97.25% as a comparable number** — different dataset, subjects, keypoints.
 
+> **Status (2026-06-10, measurement (a) complete — `benchmarks/wiflow-std/RESULTS.md`):** shipped checkpoint REFUTED (0.08% PCK@20 — wrong keypoint normalization, predates published code); released code does not run as published (6 defects, incl. broken package import and an unreachable test phase); released dataset's last 13 files are corrupted (9,072 windows: NaN + float32-max garbage, diverges fp16 training via BatchNorm poisoning). After repairing both, retraining with upstream defaults reproduced **96.09% PCK@20 full-test / 96.61% corruption-free / MPJPE 0.0094–0.0098** (published: 97.25% / 0.007) on an RTX 5080. Accuracy claims graded MEASURED-EQUIVALENT; params (2.23M) and FLOPs (~0.055G) verified. (b)/(c) remain open.
+
 ### 2.3 Apply the UNSW recipe to the ADR-150 encoder — ACCEPTED (amends ADR-150 §2.3)
 
 - Pretraining corpus: start from the same 14 public datasets (1.3M samples) + our home/MM-Fi frames; data aggregation takes priority over architecture work.

@@ -1,0 +1,16 @@
+# Upstream clone (WiFlow-STD, DY2434) -- never commit third-party code/weights
+upstream/
+
+# Local python env
+.venv/
+
+# Downloaded data / artifacts
+data/
+downloads/
+*.pth
+*.pt
+*.npy
+*.npz
+*.zip
+*.mat
+__pycache__/
