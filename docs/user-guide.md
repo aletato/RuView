@@ -1747,7 +1747,14 @@ See [ADR-071](adr/ADR-071-ruvllm-training-pipeline.md) and the [pretraining tuto
 
 For significantly higher accuracy, use a webcam as a **temporary teacher** during training. The camera captures real 17-keypoint poses via MediaPipe, paired with simultaneous ESP32 CSI data. After training, the camera is no longer needed — the model runs on CSI only.
 
-**Result: 92.9% PCK@20** from a 5-minute collection session.
+> **Accuracy note (2026-06-10):** the previously cited "92.9% PCK@20" figure is
+> retracted — a forensic recheck of the surviving eval holdout showed it came
+> from a constant-output model scored with an absolute (non-torso-normalized)
+> threshold on 69 nearly-static frames, a protocol under which a trivial
+> mean-pose predictor scores 100%. No measured camera-supervised PCK@20 is
+> currently published (see CHANGELOG, PR #535). Treat this workflow as a data
+> collection mechanism; accuracy claims will follow a ≥35-minute multi-pose
+> collection session evaluated with torso-normalized PCK.
 
 ### Requirements
 

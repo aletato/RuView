@@ -16,3 +16,4 @@ downloads/
 *.safetensors
 results/parity_fixture.json
 __pycache__/
+*.onnx

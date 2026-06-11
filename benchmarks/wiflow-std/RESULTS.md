@@ -104,7 +104,113 @@ checkpoint REFUTED; dataset/code require repairs)**. RuView docs may cite
 ESP32 numbers (different hardware, 5 subjects, in-domain random split,
 15 keypoints).
 
+## Edge optimization (measured)
+
+ADR-152 "optimize beyond SOTA" track, 2026-06-10, this Windows box (Windows 11,
+16 torch threads, torch 2.12.0+cpu, onnxruntime 1.26.0). Subject: the retrained
+checkpoint `results/retrained_best_pose_model.pth` (2,225,042 fp32 params).
+Scripts: `quantize_bench.py`, `onnx_bench.py`, `eval_ort_accuracy.py`.
+Raw numbers: `results/edge_optimization.json`.
+
+Accuracy is on a **10,000-window seed-42 random subset** of the corruption-free
+test split (same seed-42 file-level 70/15/15 split as `eval_repro.py`; 54,000
+test windows, 1,440 corrupted excluded via `results/nan_windows_mask.npy` |
+`results/big_windows_mask.npy`, leaving 52,560; subset drawn with
+`np.random.default_rng(42)`). The fp32 subset PCK@20 (96.68%) matches the full
+clean-test figure (96.61%), so the subset is representative.
+
+Latency is CPU ms/window, median of repeated runs, 3 interleaved repetitions
+per variant (medians below; run-to-run spread on this box is large, roughly
+±20-40% at batch 1 — reps are in the JSON).
+
+| Variant | Disk size | Batch 1 (ms/win) | Batch 64 (ms/win) | PCK@20 | PCK@50 | MPJPE |
+|---|---|---|---|---|---|---|
+| torch fp32 (baseline) | 9.07 MB | 11.0 | 2.27 | 96.68% | 99.15% | 0.00936 |
+| torch fp16 (`.half()`) | **4.58 MB** | 24.3 | 2.42 | 96.68% | 99.15% | 0.00946 |
+| torch int8 dynamic | 9.07 MB (unchanged) | 15.6 | 2.06 | 96.68% (identical) | 99.15% | 0.00936 |
+| ONNX fp32 (onnxruntime) | 8.97 MB | **3.2** | **2.0** | 96.68% | 99.15% | 0.00936 |
+| ONNX int8 (ORT dynamic, supplementary) | **2.44 MB** | 6.5 | 5.8 | 96.52% | 99.15% | 0.01108 |
+
+Findings:
+
+- **torch dynamic INT8 quantizes nothing on this model.** The architecture has
+  **zero `nn.Linear` layers** — it is entirely Conv1d (21) + Conv2d (22) +
+  BatchNorm. `torch.ao.quantization.quantize_dynamic` (requested over
+  `{Linear, Conv1d, Conv2d}`) converted **0 modules / 0.0% of params**: dynamic
+  quantization only has kernels for Linear/RNN-family modules and silently
+  skips convolutions. The "int8" model is bit-identical to fp32 (same outputs,
+  same 9.07 MB). Conv quantization would require static (PTQ) quantization
+  with calibration — out of scope here; the ORT dynamic path below is the
+  honest int8 datapoint.
+- **fp16 halves size for free accuracy-wise** (PCK@20 −0.005 pt, MPJPE
+  +0.0001) but is *slower* on CPU at batch 1 (~2.2×) — torch CPU fp16 conv
+  kernels are emulated. fp16 is a storage/transport format here, not a CPU
+  runtime win.
+- **ONNX Runtime is the real batch-1 latency win: ~3.4× faster than torch**
+  (3.2 vs 11.0 ms/window) at identical accuracy (parity 2.4e-7).
+
+### Verdict on the paper's "~2.2 MB int8" claim
+
+**Plausible but not free, and unreachable by the obvious PyTorch route.**
+2,225,042 params × 1 byte ≈ 2.2 MB assumes *every* parameter quantizes.
+PyTorch dynamic quantization — the one-liner most readers would reach for —
+yields **9.07 MB (0% quantized)** because the model has no Linear layers.
+ONNX Runtime dynamic quantization, which does have int8 conv weight support,
+gets **2.44 MB** (close to the claim; the overhead is BatchNorm params/buffers
+and quantization scales kept in fp32) at a measurable accuracy cost:
+PCK@20 96.68 → 96.52% (−0.16 pt) and MPJPE 0.00936 → 0.01108 (+18%), and
+~2× slower inference than ONNX fp32 (ConvInteger kernels). The paper does not
+state a method or an int8 accuracy; treat "2.2 MB" as a weight-arithmetic
+estimate, achievable in practice only via conv-capable quantization toolchains
+and with a small accuracy penalty.
+
+### ONNX export status
+
+**Works.** Exported via the TorchScript exporter (`dynamo=False`), opset 17,
+with a dynamic batch axis — `results/retrained_fp32_dynamic.onnx` (8.97 MB),
+verified to run at batch 1/2/64. The axial attention's
+`view(N*W, C, H)` reshape traced correctly (sizes recorded as graph ops, not
+baked constants). The dynamo exporter also captures the graph but crashed on
+this box writing a ✅ to a cp1252 console (cosmetic Windows encoding issue, not
+a model blocker). Parity vs torch on the stored fixture
+(`results/parity_fixture.npz`, batch 2, seed 42): **max abs diff 2.4e-7 —
+PASS** (< 1e-4). ORT-quantized int8 model: `results/retrained_int8_ort_dynamic.onnx`.
+
+## Measurement (b): BLOCKED-ON-DATA (attempted 2026-06-10)
+
+The fine-tune-on-ESP32 measurement stopped at dataset characterization, per the
+pre-registered stop rule (<2,000 paired windows). Findings (MEASURED):
+
+- **Only one trainable paired dataset exists**: `ruvultra:~/work/cog-pose-train/paired.jsonl`
+  — 1,077 windows (one subject, one room, one 29.9-min session, single node;
+  CSI [56, 20]; 17 COCO keypoints, MediaPipe confidence mean 0.44 — only 264
+  windows pass ADR-079's own conf>0.5 training filter). Prior measured attempts
+  on this exact set: 0–3% torso-PCK@20 (temporal splits, three independent
+  pipelines). Fine-tuning a 2.23M-param model on ~860 train windows would
+  measure memorization, not transfer.
+- **The April session behind the old "92.9% PCK@20" claim is lost** (345
+  samples, 35 subcarriers; raw CSI gone from ruvzen/ruvultra/cognitum-v0; only
+  a 69-sample predictions+GT holdout survives at `models/wiflow-real/eval-holdout.jsonl`).
+- **Forensic recheck of that holdout RETRACTS the 92.9% figure**: the trainer's
+  `pck()` used an absolute 0.2 image-unit threshold (not torso-normalized) and
+  the model output a **constant pose** (pred std 0.0000 across 69 near-static
+  frames; a mean predictor scores 100% under the same protocol). The
+  torso-normalized PCK@20 on the same holdout is 19.1%. This corroborates the
+  2026-05-11 audit retraction (CHANGELOG, PR #535); stale doc citations were
+  removed 2026-06-10 (user-guide, readme-details, ADR-152 §2.1.3). The §2.2
+  no-citation rule now applies to ADR-079 accuracy claims.
+
+Unblock criteria: a paired collection session of ≥2k windows (≈35+ min at the
+observed stride; multi-pose, conf>0.5, ideally with the §2.1.3 two-checkerboard
+calibration), plus a re-baselined our-pipeline number under torso-PCK@20 on the
+same split. WiFlow-STD assets stand ready on ruvultra (`~/wiflow-std-bench/`).
+Also worth investigating: ADR-079's protocol predicts ~9k windows per 30 min;
+the May session under-delivered ~8× (aligner drop rate?).
+
 ## Pending
 
-- (b) fine-tune on our ESP32 17-keypoint eval set.
-- (c) our internal WiFlow on their dataset (15-keypoint subset mapping).
+- (b) fine-tune on our ESP32 17-keypoint eval set — **BLOCKED-ON-DATA**, see above.
+- (c) our internal WiFlow on their dataset (15-keypoint subset mapping) — also
+  affected: there is currently no validated internal pose model to compare
+  (the 92.9% artifact is retracted; the MM-Fi SOTA models in ADR-150 §3 are a
+  different input domain).
