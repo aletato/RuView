@@ -7,6 +7,9 @@ use tauri::{AppHandle, Manager, State};
 use crate::state::AppState;
 
 /// Default binary name for the sensing server.
+#[cfg(windows)]
+const DEFAULT_SERVER_BIN: &str = "sensing-server.exe";
+#[cfg(not(windows))]
 const DEFAULT_SERVER_BIN: &str = "sensing-server";
 
 /// Find the sensing server binary path.
@@ -48,9 +51,20 @@ fn find_server_binary(app: &AppHandle, custom_path: Option<&str>) -> Result<Stri
     }
 
     // 4. Check if it's in PATH
-    if let Ok(output) = Command::new("which").arg(DEFAULT_SERVER_BIN).output() {
+    #[cfg(windows)]
+    let which_cmd = "where";
+    #[cfg(not(windows))]
+    let which_cmd = "which";
+
+    if let Ok(output) = Command::new(which_cmd).arg(DEFAULT_SERVER_BIN).output() {
         if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // `where` on Windows may return multiple lines; take the first.
+            let path = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !path.is_empty() {
                 return Ok(path);
             }
