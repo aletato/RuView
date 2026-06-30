@@ -1,11 +1,15 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(git submodule *)",
+      "Bash(python -m serial.tools.list_ports -v)",
+      "Bash(python -m esptool version)",
+      "Bash(pip install *)",
+      "Bash(python -m esptool --chip esp32s3 --port COM3 --baud 460800 write_flash --flash_mode dio --flash_size 4MB 0x0 firmware/esp32-csi-node/release_bins/bootloader.bin 0x8000 firmware/esp32-csi-node/release_bins/partition-table-4mb.bin 0xf000 firmware/esp32-csi-node/release_bins/ota_data_initial.bin 0x20000 firmware/esp32-csi-node/release_bins/esp32-csi-node-4mb.bin)"
+    ]
+  },
   "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "claude-flow"
-  ],
-  "permissions": {
-    "allow": [
-      "Bash(git submodule *)"
-    ]
-  }
+  ]
 }
