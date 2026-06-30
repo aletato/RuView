@@ -22,7 +22,7 @@ The current Python DensePose backend requires ~2GB+ of dependencies:
 
 This makes the DensePose backend impractical for edge deployments, CI pipelines, and developer laptops where users only need WiFi sensing + pose estimation.
 
-Meanwhile, the Rust port at `rust-port/wifi-densepose-rs/` already has:
+Meanwhile, the Rust port at `v2/` already has:
 
 - **12 workspace crates** covering core, signal, nn, api, db, config, hardware, wasm, cli, mat, train
 - **5 RuVector crates** (v2.0.4, published on crates.io) integrated into signal, mat, and train crates
@@ -40,8 +40,8 @@ Use the `wifi-densepose-nn` crate with `default-features = ["onnx"]` only. This 
 
 | Component | Rust Crate | Replaces Python |
 |-----------|-----------|-----------------|
-| CSI processing | `wifi-densepose-signal::csi_processor` | `v1/src/sensing/feature_extractor.py` |
-| Motion detection | `wifi-densepose-signal::motion` | `v1/src/sensing/classifier.py` |
+| CSI processing | `wifi-densepose-signal::csi_processor` | `archive/v1/src/sensing/feature_extractor.py` |
+| Motion detection | `wifi-densepose-signal::motion` | `archive/v1/src/sensing/classifier.py` |
 | BVP extraction | `wifi-densepose-signal::bvp` | N/A (new capability) |
 | Fresnel geometry | `wifi-densepose-signal::fresnel` | N/A (new capability) |
 | Subcarrier selection | `wifi-densepose-signal::subcarrier_selection` | N/A (new capability) |
@@ -143,7 +143,7 @@ The `wifi-densepose-nn::onnx` module loads `.onnx` files directly.
 
 ```bash
 # Build the Rust workspace (ONNX-only, no libtorch)
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo check --workspace 2>&1
 
 # Build release binary

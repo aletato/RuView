@@ -46,7 +46,7 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 FIRMWARE_DIR = PROJECT_ROOT / "firmware" / "esp32-csi-node"
-RUST_DIR = PROJECT_ROOT / "rust-port" / "wifi-densepose-rs"
+RUST_DIR = PROJECT_ROOT / "v2" / "wifi-densepose-rs"
 PROVISION_SCRIPT = FIRMWARE_DIR / "provision.py"
 PRESETS_DIR = SCRIPT_DIR / "swarm_presets"
 
@@ -259,11 +259,16 @@ def provision_node(
     if stale.exists():
         stale.unlink()
 
-    # Build provision.py arguments
+    # Build provision.py arguments.
+    # --force-partial: this is a per-node TDM/channel overlay; WiFi
+    # credentials live in the base flash image, not the per-node NVS slice.
+    # Without --force-partial, provision.py rejects calls missing the
+    # --ssid/--password/--target-ip trio (issue #391 guard).
     args = [
         sys.executable, str(PROVISION_SCRIPT),
         "--port", "/dev/null",
         "--dry-run",
+        "--force-partial",
         "--node-id", str(node.node_id),
         "--tdm-slot", str(node.tdm_slot),
         "--tdm-total", str(n_total),

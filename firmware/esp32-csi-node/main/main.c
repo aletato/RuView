@@ -16,7 +16,9 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_app_desc.h"
 #include "sdkconfig.h"
+#include "led_strip.h"
 
 #include "csi_collector.h"
 #include "stream_sender.h"
@@ -29,6 +31,13 @@
 #include "display_task.h"
 #include "mmwave_sensor.h"
 #include "swarm_bridge.h"
+#include "rv_radio_ops.h"          /* ADR-081 Layer 1 — Radio Abstraction Layer. */
+#include "adaptive_controller.h"   /* ADR-081 Layer 2 — Adaptive controller. */
+#include "c6_twt.h"                /* ADR-110: TWT (no-op stub on S3) */
+#include "c6_timesync.h"           /* ADR-110: 802.15.4 mesh time-sync (no-op on S3) */
+#include "c6_lp_core.h"            /* ADR-110: LP-core hibernation (no-op on S3) */
+#include "c6_sync_espnow.h"        /* ADR-110 D1 workaround: ESP-NOW sync */
+#include "c6_softap_he.h"          /* ADR-110 B1/B2: HE/TWT soft-AP (no-op when disabled) */
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -108,6 +117,17 @@ static void wifi_init_sta(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+#if defined(CONFIG_IDF_TARGET_ESP32C6) && defined(CONFIG_C6_SOFTAP_HE_ENABLE)
+    /* ADR-110 B1/B2 cheap-unblock: bring up a soft-AP that advertises HE +
+     * TWT Responder=1 so a second C6 board can negotiate iTWT against
+     * this node. c6_softap_he_start() switches the mode to AP+STA. */
+    uint8_t softap_chan = 0;
+    if (c6_softap_he_start(&softap_chan) == ESP_OK) {
+        ESP_LOGI(TAG, "C6 soft-AP HE armed on channel %u (ADR-110 B1/B2)", softap_chan);
+    }
+#endif
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "WiFi STA initialized, connecting to SSID: %s", g_nvs_config.wifi_ssid);
@@ -124,6 +144,54 @@ static void wifi_init_sta(void)
     }
 }
 
+#if CONFIG_LED_GAMMA_VIZ
+/* Viridis colormap (60 steps), generated from ruv-neural-viz::ColorMap::viridis()
+ * — the rUv-Neural brain-topology colormap, now no_std (ruvnet/ruv-neural#3 /
+ * RuView#1126). Used as the ON-phase colour of the 40 Hz gamma flicker below:
+ * dark-purple (still) -> teal -> green -> yellow (strong motion). */
+static const uint8_t VIRIDIS_LUT[60][3] = {
+    { 68,  1, 84},{ 67,  6, 88},{ 67, 12, 91},{ 66, 17, 95},{ 66, 23, 99},
+    { 65, 28,103},{ 64, 34,106},{ 64, 39,110},{ 63, 45,114},{ 63, 50,118},
+    { 62, 56,121},{ 61, 61,125},{ 61, 67,129},{ 60, 72,132},{ 59, 78,136},
+    { 59, 83,139},{ 57, 87,139},{ 55, 92,139},{ 53, 96,139},{ 52,100,139},
+    { 50,104,139},{ 48,109,139},{ 46,113,139},{ 44,117,140},{ 43,122,140},
+    { 41,126,140},{ 39,130,140},{ 37,134,140},{ 36,139,140},{ 34,143,140},
+    { 35,147,139},{ 39,151,136},{ 43,154,133},{ 47,158,130},{ 52,162,127},
+    { 56,166,124},{ 60,170,121},{ 64,173,119},{ 68,177,116},{ 72,181,113},
+    { 76,185,110},{ 81,189,107},{ 85,192,104},{ 89,196,102},{ 93,200, 99},
+    {102,203, 95},{113,205, 91},{124,207, 87},{134,209, 82},{145,211, 78},
+    {156,213, 74},{167,215, 70},{178,217, 66},{188,219, 62},{199,221, 58},
+    {210,223, 54},{221,225, 49},{231,227, 45},{242,229, 41},{253,231, 37},
+};
+static led_strip_handle_t s_viz_led;
+
+/* motion_energy that saturates the colormap to yellow (CONFIG, milli-units). */
+#define LED_MOTION_FULLSCALE ((float)CONFIG_LED_MOTION_FULLSCALE_MILLI / 1000.0f)
+
+/* GENUS-style 40 Hz gamma flicker: full on/off square wave, 50% duty (toggled
+ * every 12.5 ms → 40 Hz). The ON colour is live CSI motion (edge motion_energy)
+ * mapped through the ruv-neural-viz viridis LUT — still=purple, moving=yellow.
+ * So the LED is a real 40 Hz gamma stimulus whose hue tracks sensed motion. */
+static void led_gamma_40hz_cb(void *arg)
+{
+    static bool on = false;
+    on = !on;
+    if (on) {
+        edge_vitals_pkt_t v;
+        float m = edge_get_vitals(&v) ? v.motion_energy : 0.0f;
+        float norm = m / LED_MOTION_FULLSCALE;
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        int idx = (int)(norm * 59.0f + 0.5f);
+        const uint8_t *c = VIRIDIS_LUT[idx];
+        led_strip_set_pixel(s_viz_led, 0, c[0], c[1], c[2]); /* R,G,B (driver maps to GRB) */
+    } else {
+        led_strip_set_pixel(s_viz_led, 0, 0, 0, 0);          /* off phase */
+    }
+    led_strip_refresh(s_viz_led);
+}
+#endif /* CONFIG_LED_GAMMA_VIZ */
+
 void app_main(void)
 {
     /* Initialize NVS */
@@ -137,7 +205,84 @@ void app_main(void)
     /* Load runtime config (NVS overrides Kconfig defaults) */
     nvs_config_load(&g_nvs_config);
 
-    ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — Node ID: %d", g_nvs_config.node_id);
+    /* Capture node_id IMMEDIATELY — before wifi_init_sta() can corrupt
+     * g_nvs_config. See #232/#375/#390: WiFi driver init clobbers the struct
+     * on some devices, reverting node_id to the Kconfig default of 1. */
+    csi_collector_set_node_id(g_nvs_config.node_id);
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    const char *target_name = "ESP32-C6";
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+    const char *target_name = "ESP32-S3";
+#else
+    const char *target_name = "ESP32";
+#endif
+    ESP_LOGI(TAG, "%s CSI Node (ADR-018 / ADR-110) — v%s — Node ID: %d",
+             target_name, app_desc->version, g_nvs_config.node_id);
+
+    /* Onboard WS2812. C6 wires the LED to GPIO 8; S3 to GPIO 38 (DevKitC-1 v1.0)
+     * or GPIO 48 (DevKitC-1 v1.1 / N16R8 — see #962). On S3 we drive 48 (the
+     * common module). On C6, GPIO 38/48 don't exist (only 0-30) — gate by target.
+     * Behaviour is set by CONFIG_LED_GAMMA_VIZ (ADR-183): on = 40 Hz gamma flicker
+     * coloured by CSI motion; off = clear the LED at boot. */
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    const int led_gpio = 8;
+#else
+    const int led_gpio = 48;
+#endif
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = led_gpio,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+        .flags.with_dma = false,
+    };
+#if CONFIG_LED_GAMMA_VIZ
+    if (led_strip_new_rmt_device(&strip_config, &rmt_config, &s_viz_led) == ESP_OK) {
+        const esp_timer_create_args_t viz_args = {
+            .callback = &led_gamma_40hz_cb,
+            .name = "led_gamma_40hz",
+        };
+        esp_timer_handle_t viz_timer;
+        if (esp_timer_create(&viz_args, &viz_timer) == ESP_OK) {
+            esp_timer_start_periodic(viz_timer, 12500); // 12.5 ms toggle → 40 Hz square wave
+            ESP_LOGI(TAG, "Onboard WS2812: 40 Hz gamma flicker (GENUS), colour=CSI motion via ruv-neural-viz, GPIO %d", led_gpio);
+        }
+    }
+#else
+    /* Viz disabled — clear the onboard LED at boot and release the RMT channel. */
+    led_strip_handle_t led_strip;
+    if (led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip) == ESP_OK) {
+        led_strip_clear(led_strip);
+        led_strip_del(led_strip);
+    }
+#endif /* CONFIG_LED_GAMMA_VIZ */
+
+    /* ADR-110 P4: 802.15.4 mesh time-sync (C6 only).
+     * Initialized BEFORE WiFi so it's available even when WiFi STA can't
+     * connect — the radios are physically independent on the C6.
+     * No-op on S3 (the helper compiles to an empty inline stub). */
+#if defined(CONFIG_IDF_TARGET_ESP32C6) && defined(CONFIG_C6_TIMESYNC_ENABLE)
+    esp_err_t ts_ret = c6_timesync_init(CONFIG_C6_TIMESYNC_CHANNEL);
+    if (ts_ret != ESP_OK) {
+        ESP_LOGW(TAG, "c6_timesync_init failed: %s (continuing without 15.4 sync)",
+                 esp_err_to_name(ts_ret));
+    }
+#endif
+
+    /* ADR-110 P5: Optionally arm LP-core wake-on-motion (C6 only, opt-in).
+     * Default off — only nodes flashed for battery-powered seed duty enable
+     * this in menuconfig. */
+#if defined(CONFIG_IDF_TARGET_ESP32C6) && defined(CONFIG_C6_LP_CORE_ENABLE)
+    if (c6_lp_core_was_motion_wake()) {
+        ESP_LOGI(TAG, "boot cause: LP-core motion wake (running CSI burst)");
+    }
+#endif
 
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
@@ -167,6 +312,37 @@ void app_main(void)
     }
 #else
     csi_collector_init();
+
+    /* ADR-073: Start multi-frequency channel hopping if configured in NVS. */
+    if (g_nvs_config.channel_hop_count > 1) {
+        ESP_LOGI(TAG, "Starting channel hopping: %u channels, dwell=%lu ms",
+                 (unsigned)g_nvs_config.channel_hop_count,
+                 (unsigned long)g_nvs_config.dwell_ms);
+        csi_collector_set_hop_table(
+            g_nvs_config.channel_list,
+            g_nvs_config.channel_hop_count,
+            g_nvs_config.dwell_ms);
+    }
+#endif
+
+    /* ADR-110 P3: Request TWT from the AP for deterministic CSI cadence.
+     * No-op on S3 (the helper compiles to an empty inline stub). On C6
+     * the AP may NACK — the helper logs and falls back to opportunistic.
+     * Called only after WiFi STA connect (wifi_init_sta blocks until then). */
+#if defined(CONFIG_IDF_TARGET_ESP32C6) && defined(CONFIG_C6_TWT_ENABLE)
+    c6_twt_setup_default();
+#endif
+
+    /* ADR-110 D1 workaround: ESP-NOW cross-node sync. Initialized after
+     * WiFi STA connects (ESP-NOW needs the WiFi driver up). Works on
+     * both S3 and C6 — replaces the broken 802.15.4 RX path in c6_timesync.
+     * Skip on QEMU mock (no real WiFi → no ESP-NOW). */
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    esp_err_t espnow_ret = c6_sync_espnow_init();
+    if (espnow_ret != ESP_OK) {
+        ESP_LOGW(TAG, "c6_sync_espnow_init failed: %s (continuing without ESP-NOW sync)",
+                 esp_err_to_name(espnow_ret));
+    }
 #endif
 
     /* ADR-039: Initialize edge processing pipeline. */
@@ -253,7 +429,7 @@ void app_main(void)
         strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);
         strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);
         strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);
-        swarm_ret = swarm_bridge_init(&swarm_cfg, g_nvs_config.node_id);
+        swarm_ret = swarm_bridge_init(&swarm_cfg, csi_collector_get_node_id());
         if (swarm_ret != ESP_OK) {
             ESP_LOGW(TAG, "Swarm bridge init failed: %s", esp_err_to_name(swarm_ret));
         }
@@ -263,6 +439,31 @@ void app_main(void)
 #else
     ESP_LOGI(TAG, "Mock CSI mode: skipping swarm bridge");
 #endif
+
+    /* ADR-081 Layer 1: register the active radio ops binding.
+     * - Real hardware: ESP32 binding wrapping csi_collector + esp_wifi.
+     * - QEMU / offline: mock binding wrapping mock_csi.c.
+     * Either way, the layers above (adaptive controller, mesh plane,
+     * feature extraction) address the radio through the same vtable —
+     * this is the portability acceptance test in ADR-081. */
+#ifdef CONFIG_CSI_MOCK_ENABLED
+    rv_radio_ops_mock_register();
+#else
+    rv_radio_ops_esp32_register();
+#endif
+    const rv_radio_ops_t *radio_ops = rv_radio_ops_get();
+    if (radio_ops != NULL && radio_ops->init != NULL) {
+        radio_ops->init();
+    }
+
+    /* ADR-081 Layer 2: start the adaptive controller. NULL config → use
+     * Kconfig defaults. Default policy is conservative: no channel
+     * switching, no role change. Operators opt in via menuconfig. */
+    esp_err_t adapt_ret = adaptive_controller_init(NULL);
+    if (adapt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Adaptive controller init failed: %s",
+                 esp_err_to_name(adapt_ret));
+    }
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
@@ -275,13 +476,29 @@ void app_main(void)
     }
 #endif
 
-    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s)",
+    /* RuView#893/#521: the MGMT-only promiscuous filter (set in
+     * csi_collector_init as the #396 display-crash workaround) starves the CSI
+     * callback on display-less boards — yield collapses to 0 pps and the node
+     * looks dead despite being on the network. Now that the display probe has
+     * run, boards with no AMOLED panel (no QSPI/SPI-flash cache contention)
+     * upgrade the filter to capture DATA frames too, restoring CSI yield. */
+#ifdef CONFIG_DISPLAY_ENABLE
+    bool has_display = display_is_active();   /* runtime panel probe result */
+#else
+    bool has_display = false;                 /* display support not compiled in */
+#endif
+    if (!has_display) {
+        csi_collector_enable_data_capture();
+    }
+
+    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s, adapt=%s)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              g_nvs_config.edge_tier,
              (ota_ret == ESP_OK) ? "ready" : "off",
              (wasm_ret == ESP_OK) ? "ready" : "off",
              (mmwave_ret == ESP_OK) ? "active" : "off",
-             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off");
+             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off",
+             (adapt_ret == ESP_OK) ? "on" : "off");
 
     /* Main loop — keep alive */
     while (1) {

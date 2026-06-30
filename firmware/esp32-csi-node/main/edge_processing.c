@@ -2,8 +2,9 @@
  * @file edge_processing.c
  * @brief ADR-039 Edge Intelligence — dual-core CSI processing pipeline.
  *
- * Core 0 (WiFi task): Pushes raw CSI frames into lock-free SPSC ring buffer.
- * Core 1 (DSP task):  Pops frames, runs signal processing pipeline:
+ * Core 0 (WiFi path): Pushes raw CSI frames into lock-free SPSC ring buffer.
+ * Second core when present (DSP task): pops frames, runs signal processing pipeline.
+ * On unicore targets (e.g. ESP32-C6), the DSP task is pinned to core 0.
  *   1. Phase extraction from I/Q pairs
  *   2. Phase unwrapping (continuous phase)
  *   3. Welford variance tracking per subcarrier
@@ -19,6 +20,7 @@
 
 #include "edge_processing.h"
 #include "nvs_config.h"
+#include "csi_collector.h"  /* csi_collector_get_node_id() - defensive #390 */
 #include "mmwave_sensor.h"
 
 /* Runtime config — declared in main.c, loaded from NVS at boot. */
@@ -41,12 +43,20 @@ static const char *TAG = "edge_proc";
  * ====================================================================== */
 
 static edge_ring_buf_t s_ring;
+static uint32_t s_ring_drops;  /* Frames dropped due to full ring buffer. */
+
+/* Scratch buffers for BPM estimation — moved from stack to static to avoid
+ * stack overflow.  process_frame + update_multi_person_vitals combined used
+ * ~6.5-7.5 KB of the 8 KB task stack.  These save ~4 KB of stack. */
+static float s_scratch_br[EDGE_PHASE_HISTORY_LEN];
+static float s_scratch_hr[EDGE_PHASE_HISTORY_LEN];
 
 static inline bool ring_push(const uint8_t *iq, uint16_t len,
                              int8_t rssi, uint8_t channel)
 {
     uint32_t next = (s_ring.head + 1) % EDGE_RING_SLOTS;
     if (next == s_ring.tail) {
+        s_ring_drops++;
         return false;  /* Full — drop frame. */
     }
 
@@ -205,6 +215,113 @@ static float estimate_bpm_zero_crossing(const float *history, uint16_t len,
     return freq_hz * 60.0f;  /* Hz to BPM. */
 }
 
+/**
+ * Autocorrelation periodicity estimator (RuView #954/#985/#987 follow-up).
+ *
+ * Zero-crossing HR estimation parked at ~45 BPM for two reasons: (1) it used a
+ * stale fixed sample rate (10 Hz) after #985's self-ping raised the real CSI
+ * rate to a variable ~13-19 Hz, and (2) it locked onto breathing harmonics —
+ * a 0.25 Hz breathing fundamental puts its 3rd harmonic at ~0.74 Hz ≈ 44 BPM,
+ * right inside the HR band. This finds the dominant period in the HR band by
+ * autocorrelation, explicitly rejecting lags that coincide with breathing
+ * harmonics, and refines the peak with parabolic interpolation. Uses the
+ * MEASURED sample rate so the BPM is in real units.
+ *
+ * @param sig          Band-filtered signal (contiguous, oldest..newest).
+ * @param len          Number of samples.
+ * @param fs           Measured sample rate in Hz.
+ * @param bpm_lo       Low edge of the search band (BPM).
+ * @param bpm_hi       High edge of the search band (BPM).
+ * @param reject_br_hz Breathing fundamental (Hz) whose harmonics are rejected
+ *                     (k=1..6); pass 0 to disable rejection (fundamental search).
+ * @return Dominant rate in BPM within the band, or 0 if no confident peak.
+ */
+static float estimate_periodicity_autocorr(const float *sig, uint16_t len, float fs,
+                                            float bpm_lo, float bpm_hi, float reject_br_hz)
+{
+    if (len < 32 || fs <= 0.0f || bpm_hi <= bpm_lo) return 0.0f;
+
+    int lag_min = (int)(fs * 60.0f / bpm_hi);
+    int lag_max = (int)(fs * 60.0f / bpm_lo);
+    if (lag_min < 2) lag_min = 2;
+    if (lag_max >= (int)len) lag_max = (int)len - 1;
+    if (lag_max <= lag_min + 1) return 0.0f;
+
+    const float br_hz = reject_br_hz;
+
+    float r0 = 0.0f;
+    for (uint16_t i = 0; i < len; i++) r0 += sig[i] * sig[i];
+    if (r0 <= 1e-6f) return 0.0f;
+
+    float best = -1.0f;
+    int   best_lag = 0;
+
+    for (int lag = lag_min; lag <= lag_max; lag++) {
+        float f = fs / (float)lag;  /* candidate HR frequency (Hz) */
+
+        /* Reject candidates within 8% of a breathing harmonic k*f_br (k=1..6). */
+        if (br_hz > 0.0f) {
+            bool harmonic = false;
+            for (int k = 1; k <= 6; k++) {
+                float h = (float)k * br_hz;
+                if (fabsf(f - h) < 0.08f * h) { harmonic = true; break; }
+            }
+            if (harmonic) continue;
+        }
+
+        float acc = 0.0f;
+        for (int i = 0; i + lag < (int)len; i++) acc += sig[i] * sig[i + lag];
+        if (acc > best) { best = acc; best_lag = lag; }
+    }
+
+    if (best_lag == 0) return 0.0f;
+    /* Require a real periodicity, not a noise peak. */
+    if (best / r0 < 0.2f) return 0.0f;
+
+    /* Parabolic interpolation around best_lag for sub-sample period resolution. */
+    float lag_ref = (float)best_lag;
+    {
+        float a = 0.0f, c = 0.0f;
+        for (int i = 0; i + (best_lag - 1) < (int)len; i++) a += sig[i] * sig[i + best_lag - 1];
+        for (int i = 0; i + (best_lag + 1) < (int)len; i++) c += sig[i] * sig[i + best_lag + 1];
+        float denom = a - 2.0f * best + c;
+        if (fabsf(denom) > 1e-6f) {
+            float delta = 0.5f * (a - c) / denom;
+            if (delta > -1.0f && delta < 1.0f) lag_ref += delta;
+        }
+    }
+
+    return fs / lag_ref * 60.0f;
+}
+
+/* Median smoother for the emitted heart rate. The per-frame autocorr estimate
+ * still has occasional single-frame outliers (startup transient before the
+ * filters re-tune, momentary harmonic mis-locks); a median over the last few
+ * VALID estimates stops the reported HR from "dropping a lot" between frames
+ * without lagging real changes much. Only valid (in-range) estimates are
+ * pushed, so out-of-range/zero results never pollute the window. */
+#define HR_SMOOTH_N 13
+static float   s_hr_ring[HR_SMOOTH_N];
+static uint8_t s_hr_ring_n;
+static uint8_t s_hr_ring_idx;
+
+static float hr_smooth_push(float hr)
+{
+    s_hr_ring[s_hr_ring_idx] = hr;
+    s_hr_ring_idx = (uint8_t)((s_hr_ring_idx + 1) % HR_SMOOTH_N);
+    if (s_hr_ring_n < HR_SMOOTH_N) s_hr_ring_n++;
+
+    float tmp[HR_SMOOTH_N];
+    for (uint8_t i = 0; i < s_hr_ring_n; i++) tmp[i] = s_hr_ring[i];
+    for (uint8_t i = 1; i < s_hr_ring_n; i++) {       /* insertion sort, tiny N */
+        float v = tmp[i];
+        int j = (int)i - 1;
+        while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = v;
+    }
+    return tmp[s_hr_ring_n / 2];
+}
+
 /* ======================================================================
  * DSP Pipeline State
  * ====================================================================== */
@@ -236,12 +353,21 @@ static edge_biquad_t s_bq_heartrate;
 static float s_breathing_filtered[EDGE_PHASE_HISTORY_LEN];
 static float s_heartrate_filtered[EDGE_PHASE_HISTORY_LEN];
 
+/** Measured CSI sample rate (Hz), smoothed from frame timestamps.
+ * #985's self-ping raised the callback rate above the old ~10 Hz beacon
+ * assumption and made it variable (~13-19 Hz); a fixed rate scaled BPM wrong
+ * and made HR swing with CSI yield. See update in process_csi_frame(). */
+static float    s_sample_rate_hz   = 15.0f;
+static float    s_filter_design_fs = 20.0f; /* fs the biquads were last designed at */
+static uint32_t s_last_frame_ts_us = 0;
+
 /** Latest vitals state. */
 static float    s_breathing_bpm;
 static float    s_heartrate_bpm;
 static float    s_motion_energy;
 static float    s_presence_score;
 static bool     s_presence_detected;
+static uint8_t  s_presence_below_count;  /**< Consecutive frames below low thresh (issue #996). */
 static bool     s_fall_detected;
 static int8_t   s_latest_rssi;
 static uint32_t s_frame_count;
@@ -268,8 +394,16 @@ static uint8_t s_prev_iq[EDGE_MAX_IQ_BYTES];
 static uint16_t s_prev_iq_len;
 static bool s_has_prev_iq;
 
+/** ADR-069: Feature vector sequence counter. */
+static uint16_t s_feature_seq;
+
 /** Multi-person vitals state. */
 static edge_person_vitals_t s_persons[EDGE_MAX_PERSONS];
+
+/** Person-count persistence debounce (issue #998). */
+static uint8_t s_person_count_candidate;  /**< Last raw (gated) candidate count. */
+static uint8_t s_person_count_streak;     /**< Consecutive frames at the candidate. */
+static uint8_t s_person_count_stable;     /**< Emitted (debounced) count. */
 static edge_biquad_t s_person_bq_br[EDGE_MAX_PERSONS];
 static edge_biquad_t s_person_bq_hr[EDGE_MAX_PERSONS];
 static float s_person_br_filt[EDGE_MAX_PERSONS][EDGE_PHASE_HISTORY_LEN];
@@ -316,6 +450,61 @@ static void update_top_k(uint16_t n_subcarriers)
     }
 
     s_top_k_count = k;
+}
+
+/* ======================================================================
+ * Presence Flag Hysteresis + Debounce (issue #996)
+ * ====================================================================== */
+
+/**
+ * Schmitt-trigger presence decision with a clear-debounce.
+ *
+ * Pure function (no globals) so it is host-testable: feed a presence_score
+ * trace and assert the boolean flag is stable. Replaces the old single-
+ * threshold `score > threshold` compare that chattered when a noisy score
+ * dithered around the boundary (observed 2.6-26.7 for one stationary person).
+ *
+ *   - score  >  threshold              → assert presence (enter immediately)
+ *   - score  >= threshold * HYST_RATIO → hold current state (dead band)
+ *   - score  <  threshold * HYST_RATIO → count toward clearing; only clear
+ *                                        after CLEAR_FRAMES consecutive frames
+ *
+ * @param prev          Current presence flag (in/out via return + below_count).
+ * @param score         Latest presence score.
+ * @param threshold     High (enter) threshold.
+ * @param below_count   In/out: consecutive frames the score has been below the
+ *                      low threshold. Reset to 0 whenever the score recovers.
+ * @return New presence flag.
+ */
+static bool presence_flag_update(bool prev, float score, float threshold,
+                                 uint8_t *below_count)
+{
+    float low_thresh = threshold * EDGE_PRESENCE_HYST_RATIO;
+
+    if (score > threshold) {
+        /* Clearly present — assert and reset the clear debounce. */
+        *below_count = 0;
+        return true;
+    }
+
+    if (score >= low_thresh) {
+        /* Dead band: hold whatever we had, no flicker. Recovery above the low
+         * threshold also resets the clear debounce so a brief dip doesn't
+         * accumulate toward a false clear. */
+        *below_count = 0;
+        return prev;
+    }
+
+    /* Below the low threshold — candidate for clearing. */
+    if (*below_count < 0xFF) (*below_count)++;
+    if (!prev) {
+        return false;  /* Already cleared. */
+    }
+    if (*below_count >= EDGE_PRESENCE_CLEAR_FRAMES) {
+        *below_count = 0;
+        return false;  /* Sustained absence — clear. */
+    }
+    return true;  /* Still within the hold window — keep asserting. */
 }
 
 /* ======================================================================
@@ -402,10 +591,10 @@ static uint16_t delta_compress(const uint8_t *curr, uint16_t len,
 }
 
 /**
- * Send a compressed CSI frame (magic 0xC5110003).
+ * Send a compressed CSI frame (magic 0xC5110005, reassigned from 0xC5110003 for ADR-069).
  *
  * Header:
- *   [0..3]   Magic 0xC5110003 (LE)
+ *   [0..3]   Magic 0xC5110005 (LE)
  *   [4]      Node ID
  *   [5]      Channel
  *   [6..7]   Original I/Q length (LE u16)
@@ -430,7 +619,7 @@ static void send_compressed_frame(const uint8_t *iq_data, uint16_t iq_len,
     uint32_t magic = EDGE_COMPRESSED_MAGIC;
     memcpy(&pkt[0], &magic, 4);
 
-    pkt[4] = g_nvs_config.node_id;
+    pkt[4] = csi_collector_get_node_id();  /* #390: defensive copy */
     pkt[5] = channel;
     memcpy(&pkt[6], &iq_len, 2);
     memcpy(&pkt[8], &comp_len, 2);
@@ -454,6 +643,112 @@ store_prev:
  * ====================================================================== */
 
 /**
+ * Count distinct persons from per-group energy + representative subcarrier (issue #998).
+ *
+ * Pure function (no globals) so it is host-testable. Each of the `n_groups`
+ * subcarrier groups is a *candidate* person. A candidate is counted only if:
+ *   1. Energy gate   — its energy >= EDGE_PERSON_MIN_ENERGY_RATIO * max energy.
+ *                      One body's multipath spreads energy unevenly across the
+ *                      groups; weak groups are reflections, not extra people.
+ *   2. Spatial dedup — its representative subcarrier is at least
+ *                      EDGE_PERSON_MIN_SC_SEP away from every already-counted
+ *                      person. Adjacent subcarriers see the same reflection, so
+ *                      a near-duplicate group is the same body.
+ *
+ * The strongest group is always counted (so a present body yields >= 1).
+ *
+ * @param energy   Per-group energy (e.g. phase variance), length n_groups.
+ * @param sc_idx   Per-group representative subcarrier index, length n_groups.
+ * @param n_groups Number of candidate groups (<= EDGE_MAX_PERSONS).
+ * @return Distinct person count in [0, n_groups].
+ */
+static uint8_t count_distinct_persons(const float *energy, const uint8_t *sc_idx,
+                                      uint8_t n_groups)
+{
+    if (n_groups == 0) return 0;
+
+    /* Strongest group sets the reference energy. */
+    float max_energy = 0.0f;
+    for (uint8_t g = 0; g < n_groups; g++) {
+        if (energy[g] > max_energy) max_energy = energy[g];
+    }
+    /* No real signal anywhere → no persons. */
+    if (max_energy <= 0.0f) return 0;
+
+    float min_energy = max_energy * EDGE_PERSON_MIN_ENERGY_RATIO;
+
+    uint8_t counted_sc[EDGE_MAX_PERSONS];
+    uint8_t count = 0;
+
+    /* Greedy by descending energy: take the strongest unclaimed group that is
+     * spatially separated from everything already counted. */
+    bool used[EDGE_MAX_PERSONS];
+    for (uint8_t g = 0; g < n_groups && g < EDGE_MAX_PERSONS; g++) used[g] = false;
+
+    for (uint8_t iter = 0; iter < n_groups && iter < EDGE_MAX_PERSONS; iter++) {
+        /* Find the strongest still-unused group above the energy gate. */
+        int best = -1;
+        float best_e = min_energy;  /* must beat the gate */
+        for (uint8_t g = 0; g < n_groups && g < EDGE_MAX_PERSONS; g++) {
+            if (used[g]) continue;
+            if (energy[g] >= best_e) { best_e = energy[g]; best = g; }
+        }
+        if (best < 0) break;  /* nothing left above the gate */
+        used[best] = true;
+
+        /* Spatial dedup against already-counted persons. */
+        bool duplicate = false;
+        for (uint8_t c = 0; c < count; c++) {
+            int sep = (int)sc_idx[best] - (int)counted_sc[c];
+            if (sep < 0) sep = -sep;
+            if (sep < EDGE_PERSON_MIN_SC_SEP) { duplicate = true; break; }
+        }
+        if (duplicate) continue;
+
+        counted_sc[count++] = sc_idx[best];
+    }
+
+    /* The strongest group always represents at least one body. */
+    if (count == 0) count = 1;
+    return count;
+}
+
+/**
+ * Debounce a raw person count so a single noisy frame can't change the emitted
+ * value (issue #998). A new candidate must hold for EDGE_PERSON_PERSIST_FRAMES
+ * consecutive frames before it replaces the stable count.
+ *
+ * Pure function (state passed by pointer) → host-testable.
+ *
+ * @param raw        Raw (gated) count this frame.
+ * @param candidate  In/out: the candidate being accumulated.
+ * @param streak     In/out: consecutive frames the candidate has held.
+ * @param stable     In/out: the currently emitted count.
+ * @return The (possibly updated) stable count.
+ */
+static uint8_t person_count_debounce(uint8_t raw, uint8_t *candidate,
+                                     uint8_t *streak, uint8_t *stable)
+{
+    if (raw == *stable) {
+        /* Agrees with what we emit — reset any pending change. */
+        *candidate = raw;
+        *streak = 0;
+        return *stable;
+    }
+    if (raw == *candidate) {
+        if (*streak < 0xFF) (*streak)++;
+    } else {
+        *candidate = raw;
+        *streak = 1;
+    }
+    if (*streak >= EDGE_PERSON_PERSIST_FRAMES) {
+        *stable = *candidate;
+        *streak = 0;
+    }
+    return *stable;
+}
+
+/**
  * Update multi-person vitals by assigning top-K subcarriers to person groups.
  *
  * Division strategy: top-K subcarriers are evenly divided among
@@ -472,10 +767,25 @@ static void update_multi_person_vitals(const uint8_t *iq_data, uint16_t n_sc,
 
     uint8_t subs_per_person = s_top_k_count / n_persons;
 
+    /* Per-group energy + representative subcarrier, for the #998 person gate. */
+    float   group_energy[EDGE_MAX_PERSONS] = {0};
+    uint8_t group_sc[EDGE_MAX_PERSONS]     = {0};
+
     for (uint8_t p = 0; p < n_persons; p++) {
         edge_person_vitals_t *pv = &s_persons[p];
-        pv->active = true;
         pv->subcarrier_idx = s_top_k[p * subs_per_person];
+        group_sc[p] = s_top_k[p * subs_per_person];
+
+        /* Group energy = max Welford variance over its subcarriers. This is the
+         * same variance used for top-K selection, so a multipath group (weak,
+         * adjacent to the strong one) registers low energy and gets gated out. */
+        float energy = 0.0f;
+        for (uint8_t s = 0; s < subs_per_person; s++) {
+            uint8_t sc = s_top_k[p * subs_per_person + s];
+            float v = (float)welford_variance(&s_subcarrier_var[sc]);
+            if (v > energy) energy = v;
+        }
+        group_energy[p] = energy;
 
         /* Average phase across this person's subcarrier group. */
         float avg_phase = 0.0f;
@@ -511,20 +821,22 @@ static void update_multi_person_vitals(const uint8_t *iq_data, uint16_t n_sc,
 
         /* Estimate BPM when we have enough history. */
         if (pv->history_len >= 64) {
-            /* Build contiguous buffer for zero-crossing. */
-            float br_buf[EDGE_PHASE_HISTORY_LEN];
-            float hr_buf[EDGE_PHASE_HISTORY_LEN];
+            /* Build contiguous buffer (reuse static scratch to save ~2 KB stack). */
             uint16_t buf_len = pv->history_len;
 
             for (uint16_t i = 0; i < buf_len; i++) {
                 uint16_t ri = (pv->history_idx + EDGE_PHASE_HISTORY_LEN
                                - buf_len + i) % EDGE_PHASE_HISTORY_LEN;
-                br_buf[i] = s_person_br_filt[p][ri];
-                hr_buf[i] = s_person_hr_filt[p][ri];
+                s_scratch_br[i] = s_person_br_filt[p][ri];
+                s_scratch_hr[i] = s_person_hr_filt[p][ri];
             }
 
-            float br = estimate_bpm_zero_crossing(br_buf, buf_len, sample_rate);
-            float hr = estimate_bpm_zero_crossing(hr_buf, buf_len, sample_rate);
+            float br = estimate_bpm_zero_crossing(s_scratch_br, buf_len, sample_rate);
+            /* Robust breathing period (autocorr) drives HR harmonic rejection —
+             * the zero-crossing estimate is too noisy under motion and notched
+             * the wrong frequencies, letting HR lock onto a breathing harmonic. */
+            float br_rob = estimate_periodicity_autocorr(s_scratch_br, buf_len, sample_rate, 6.0f, 40.0f, 0.0f);
+            float hr = estimate_periodicity_autocorr(s_scratch_hr, buf_len, sample_rate, 45.0f, 180.0f, br_rob / 60.0f);
 
             /* Sanity clamp. */
             if (br >= 6.0f && br <= 40.0f) pv->breathing_bpm = br;
@@ -532,9 +844,31 @@ static void update_multi_person_vitals(const uint8_t *iq_data, uint16_t n_sc,
         }
     }
 
-    /* Mark remaining persons as inactive. */
-    for (uint8_t p = n_persons; p < EDGE_MAX_PERSONS; p++) {
+    /* --- Issue #998: gate phantom persons by energy + spatial dedup,
+     * then debounce so a single noisy frame can't change the count. --- */
+    uint8_t raw_count = count_distinct_persons(group_energy, group_sc, n_persons);
+    uint8_t stable_count = person_count_debounce(raw_count,
+                                                 &s_person_count_candidate,
+                                                 &s_person_count_streak,
+                                                 &s_person_count_stable);
+
+    /* Mark the strongest `stable_count` groups active (descending energy); the
+     * rest — including phantom multipath groups — are inactive. */
+    bool used[EDGE_MAX_PERSONS];
+    for (uint8_t p = 0; p < EDGE_MAX_PERSONS; p++) {
+        used[p] = false;
         s_persons[p].active = false;
+    }
+    for (uint8_t n = 0; n < stable_count && n < n_persons; n++) {
+        int best = -1;
+        float best_e = -1.0f;
+        for (uint8_t p = 0; p < n_persons; p++) {
+            if (used[p]) continue;
+            if (group_energy[p] > best_e) { best_e = group_energy[p]; best = p; }
+        }
+        if (best < 0) break;
+        used[best] = true;
+        s_persons[best].active = true;
     }
 }
 
@@ -548,7 +882,7 @@ static void send_vitals_packet(void)
     memset(&pkt, 0, sizeof(pkt));
 
     pkt.magic = EDGE_VITALS_MAGIC;
-    pkt.node_id = g_nvs_config.node_id;
+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */
 
     pkt.flags = 0;
     if (s_presence_detected) pkt.flags |= 0x01;
@@ -629,6 +963,70 @@ static void send_vitals_packet(void)
 }
 
 /* ======================================================================
+ * ADR-069: Feature Vector Packet (48 bytes, sent at 1 Hz alongside vitals)
+ * ====================================================================== */
+
+static void send_feature_vector(void)
+{
+    edge_feature_pkt_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+
+    pkt.magic = EDGE_FEATURE_MAGIC;
+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */
+    pkt.reserved = 0;
+    pkt.seq = s_feature_seq++;
+    pkt.timestamp_us = esp_timer_get_time();
+
+    /* Dim 0: Presence score (0.0-1.0, normalized from raw score) */
+    float p = s_presence_score;
+    pkt.features[0] = p > 10.0f ? 1.0f : (p < 0.0f ? 0.0f : p / 10.0f);
+
+    /* Dim 1: Motion energy (normalized, 0-1 range) */
+    float m = s_motion_energy;
+    pkt.features[1] = m > 10.0f ? 1.0f : (m < 0.0f ? 0.0f : m / 10.0f);
+
+    /* Dim 2: Breathing rate (BPM / 30, 0-1 range) */
+    pkt.features[2] = s_breathing_bpm > 0.0f
+        ? (s_breathing_bpm / 30.0f > 1.0f ? 1.0f : s_breathing_bpm / 30.0f)
+        : 0.0f;
+
+    /* Dim 3: Heart rate (BPM / 120, 0-1 range) */
+    pkt.features[3] = s_heartrate_bpm > 0.0f
+        ? (s_heartrate_bpm / 120.0f > 1.0f ? 1.0f : s_heartrate_bpm / 120.0f)
+        : 0.0f;
+
+    /* Dim 4: Phase variance mean (top-K subcarriers) */
+    float var_mean = 0.0f;
+    if (s_top_k_count > 0) {
+        float var_sum = 0.0f;
+        uint8_t k = s_top_k_count < EDGE_TOP_K ? s_top_k_count : EDGE_TOP_K;
+        for (uint8_t i = 0; i < k; i++) {
+            var_sum += (float)welford_variance(&s_subcarrier_var[s_top_k[i]]);
+        }
+        var_mean = var_sum / (float)k;
+    }
+    pkt.features[4] = var_mean > 1.0f ? 1.0f : (var_mean < 0.0f ? 0.0f : var_mean);
+
+    /* Dim 5: Person count (n_persons / 4, 0-1 range) */
+    uint8_t n_active = 0;
+    for (uint8_t i = 0; i < EDGE_MAX_PERSONS; i++) {
+        if (s_persons[i].active) n_active++;
+    }
+    pkt.features[5] = (float)n_active / 4.0f;
+    if (pkt.features[5] > 1.0f) pkt.features[5] = 1.0f;
+
+    /* Dim 6: Fall risk (0.0 or 1.0 based on recent detection) */
+    pkt.features[6] = s_fall_detected ? 1.0f : 0.0f;
+
+    /* Dim 7: RSSI normalized ((rssi + 100) / 100, 0-1 range) */
+    pkt.features[7] = ((float)s_latest_rssi + 100.0f) / 100.0f;
+    if (pkt.features[7] > 1.0f) pkt.features[7] = 1.0f;
+    if (pkt.features[7] < 0.0f) pkt.features[7] = 0.0f;
+
+    stream_sender_send((const uint8_t *)&pkt, sizeof(pkt));
+}
+
+/* ======================================================================
  * Main DSP Pipeline (runs on Core 1)
  * ====================================================================== */
 
@@ -640,8 +1038,36 @@ static void process_frame(const edge_ring_slot_t *slot)
     s_frame_count++;
     s_latest_rssi = slot->rssi;
 
-    /* Assumed CSI sample rate (~20 Hz for typical ESP32 CSI). */
-    const float sample_rate = 20.0f;
+    /* Measure the REAL CSI sample rate from inter-frame timestamps. #985's
+     * self-ping made the callback rate variable (~13-19 Hz); the old fixed
+     * 10 Hz both scaled BPM wrong (true ~87 BPM read as ~45) and made HR swing
+     * as CSI yield fluctuated. EMA-smooth and clamp to a plausible band. */
+    if (s_last_frame_ts_us != 0 && slot->timestamp_us > s_last_frame_ts_us) {
+        float dt = (float)(slot->timestamp_us - s_last_frame_ts_us) * 1e-6f;
+        if (dt > 0.02f && dt < 0.5f) {            /* 2-50 Hz plausible; reject gaps/hops */
+            float inst = 1.0f / dt;
+            s_sample_rate_hz += 0.05f * (inst - s_sample_rate_hz);
+            if (s_sample_rate_hz < 8.0f)  s_sample_rate_hz = 8.0f;
+            if (s_sample_rate_hz > 30.0f) s_sample_rate_hz = 30.0f;
+        }
+    }
+    s_last_frame_ts_us = slot->timestamp_us;
+
+    /* Re-tune the biquads if the measured rate has drifted from their design fs,
+     * so the breathing (0.1-0.5 Hz) and HR (0.8-2.0 Hz) passbands stay in real
+     * Hz. biquad_bandpass_design resets delay state, so only redesign on real
+     * drift (>15%) — the autocorr window averages over the one-time transient. */
+    if (fabsf(s_sample_rate_hz - s_filter_design_fs) > 0.15f * s_filter_design_fs) {
+        biquad_bandpass_design(&s_bq_breathing, s_sample_rate_hz, 0.1f, 0.5f);
+        biquad_bandpass_design(&s_bq_heartrate, s_sample_rate_hz, 0.8f, 2.0f);
+        for (uint8_t pp = 0; pp < EDGE_MAX_PERSONS; pp++) {
+            biquad_bandpass_design(&s_person_bq_br[pp], s_sample_rate_hz, 0.1f, 0.5f);
+            biquad_bandpass_design(&s_person_bq_hr[pp], s_sample_rate_hz, 0.8f, 2.0f);
+        }
+        s_filter_design_fs = s_sample_rate_hz;
+    }
+
+    const float sample_rate = s_sample_rate_hz;
 
     /* --- Step 1-2: Phase extraction + unwrapping per subcarrier --- */
     float phases[EDGE_MAX_SUBCARRIERS];
@@ -688,24 +1114,24 @@ static void process_frame(const edge_ring_slot_t *slot)
 
     /* --- Step 7: BPM estimation (zero-crossing) --- */
     if (s_history_len >= 64) {
-        /* Build contiguous buffers from ring. */
-        float br_buf[EDGE_PHASE_HISTORY_LEN];
-        float hr_buf[EDGE_PHASE_HISTORY_LEN];
+        /* Build contiguous buffers from ring (using static scratch to save stack). */
         uint16_t buf_len = s_history_len;
 
         for (uint16_t i = 0; i < buf_len; i++) {
             uint16_t ri = (s_history_idx + EDGE_PHASE_HISTORY_LEN
                            - buf_len + i) % EDGE_PHASE_HISTORY_LEN;
-            br_buf[i] = s_breathing_filtered[ri];
-            hr_buf[i] = s_heartrate_filtered[ri];
+            s_scratch_br[i] = s_breathing_filtered[ri];
+            s_scratch_hr[i] = s_heartrate_filtered[ri];
         }
 
-        float br_bpm = estimate_bpm_zero_crossing(br_buf, buf_len, sample_rate);
-        float hr_bpm = estimate_bpm_zero_crossing(hr_buf, buf_len, sample_rate);
+        float br_bpm = estimate_bpm_zero_crossing(s_scratch_br, buf_len, sample_rate);
+        /* Robust breathing period (autocorr) drives HR harmonic rejection. */
+        float br_rob = estimate_periodicity_autocorr(s_scratch_br, buf_len, sample_rate, 6.0f, 40.0f, 0.0f);
+        float hr_bpm = estimate_periodicity_autocorr(s_scratch_hr, buf_len, sample_rate, 45.0f, 180.0f, br_rob / 60.0f);
 
         /* Sanity clamp: breathing 6-40 BPM, heart rate 40-180 BPM. */
         if (br_bpm >= 6.0f && br_bpm <= 40.0f) s_breathing_bpm = br_bpm;
-        if (hr_bpm >= 40.0f && hr_bpm <= 180.0f) s_heartrate_bpm = hr_bpm;
+        if (hr_bpm >= 40.0f && hr_bpm <= 180.0f) s_heartrate_bpm = hr_smooth_push(hr_bpm);
     }
 
     /* --- Step 8: Motion energy (variance of recent phases) --- */
@@ -738,7 +1164,12 @@ static void process_frame(const edge_ring_slot_t *slot)
     } else if (threshold == 0.0f) {
         threshold = 0.05f;  /* Default until calibrated. */
     }
-    s_presence_detected = (s_presence_score > threshold);
+    /* Issue #996: hysteresis + clear-debounce instead of a bare threshold
+     * compare, so a noisy score dithering around the boundary doesn't flicker
+     * the boolean flag. */
+    s_presence_detected = presence_flag_update(s_presence_detected,
+                                               s_presence_score, threshold,
+                                               &s_presence_below_count);
 
     /* --- Step 10: Fall detection (phase acceleration + debounce, issue #263) --- */
     if (s_history_len >= 3) {
@@ -773,6 +1204,8 @@ static void process_frame(const edge_ring_slot_t *slot)
 
     /* --- Step 11: Multi-person vitals --- */
     update_multi_person_vitals(slot->iq_data, n_subcarriers, sample_rate);
+    /* Yield after multi-person DSP so IDLE1 can feed Core 1 watchdog (#683). */
+    if (s_cfg.tier >= 2) vTaskDelay(1);
 
     /* --- Step 12: Delta compression --- */
     if (s_cfg.tier >= 2) {
@@ -784,16 +1217,18 @@ static void process_frame(const edge_ring_slot_t *slot)
     int64_t interval_us = (int64_t)s_cfg.vital_interval_ms * 1000;
     if ((now_us - s_last_vitals_send_us) >= interval_us) {
         send_vitals_packet();
+        send_feature_vector();  /* ADR-069: 48-byte feature vector at same 1 Hz cadence. */
         s_last_vitals_send_us = now_us;
 
         if ((s_frame_count % 200) == 0) {
             ESP_LOGI(TAG, "Vitals: br=%.1f hr=%.1f motion=%.4f pres=%s "
-                     "fall=%s persons=%u frames=%lu",
+                     "fall=%s persons=%u frames=%lu drops=%lu",
                      s_breathing_bpm, s_heartrate_bpm, s_motion_energy,
                      s_presence_detected ? "YES" : "no",
                      s_fall_detected ? "YES" : "no",
                      (unsigned)s_latest_pkt.n_persons,
-                     (unsigned long)s_frame_count);
+                     (unsigned long)s_frame_count,
+                     (unsigned long)s_ring_drops);
         }
     }
 
@@ -816,6 +1251,8 @@ static void process_frame(const edge_ring_slot_t *slot)
         wasm_runtime_on_frame(phases, amplitudes, variances,
                               n_subcarriers,
                               (const edge_vitals_pkt_t *)&s_latest_pkt);
+        /* Yield after WASM dispatch to feed Core 1 watchdog (#683). */
+        vTaskDelay(1);
     }
 }
 
@@ -831,18 +1268,31 @@ static void edge_task(void *arg)
 
     edge_ring_slot_t slot;
 
+    /* Maximum frames to process before a longer yield.  On busy LANs
+     * (corporate networks, many APs), the ring buffer fills continuously.
+     * Without a batch limit the task processes frames back-to-back with
+     * only 1-tick yields, which on high frame rates can still starve
+     * IDLE1 enough to trip the 5-second task watchdog.  See #266, #321. */
+
     while (1) {
-        if (ring_pop(&slot)) {
+        uint8_t processed = 0;
+
+        while (processed < EDGE_BATCH_LIMIT && ring_pop(&slot)) {
             process_frame(&slot);
-            /* Yield after every frame to feed the Core 1 watchdog.
-             * process_frame() is CPU-intensive (biquad filters, Welford stats,
-             * BPM estimation, multi-person vitals) and can take several ms.
-             * Without this yield, edge_dsp at priority 5 starves IDLE1 at
-             * priority 0, triggering the task watchdog. See issue #266. */
+            processed++;
+            /* 1-tick yield between frames within a batch. */
             vTaskDelay(1);
+        }
+
+        if (processed > 0) {
+            /* Post-batch yield: ~20 ms so IDLE1 can run and feed the
+             * Core 1 watchdog even under sustained load.  Uses pdMS_TO_TICKS
+             * for tick-rate independence (minimum 1 tick). */
+            { TickType_t d = pdMS_TO_TICKS(20); vTaskDelay(d > 0 ? d : 1); }
         } else {
-            /* No frames available — yield briefly. */
-            vTaskDelay(pdMS_TO_TICKS(1));
+            /* No frames available — sleep one full tick.
+             * NOTE: pdMS_TO_TICKS(5) == 0 at 100 Hz, which would busy-spin. */
+            vTaskDelay(1);
         }
     }
 }
@@ -919,6 +1369,7 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
     s_motion_energy = 0.0f;
     s_presence_score = 0.0f;
     s_presence_detected = false;
+    s_presence_below_count = 0;
     s_fall_detected = false;
     s_latest_rssi = 0;
     s_frame_count = 0;
@@ -942,6 +1393,9 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
     for (uint8_t p = 0; p < EDGE_MAX_PERSONS; p++) {
         s_persons[p].active = false;
     }
+    s_person_count_candidate = 0;
+    s_person_count_streak = 0;
+    s_person_count_stable = 0;
 
     /* Design biquad bandpass filters.
      * Sampling rate ~20 Hz (typical ESP32 CSI callback rate). */
@@ -960,7 +1414,9 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         return ESP_OK;
     }
 
-    /* Start DSP task on Core 1. */
+    /* Pin DSP off WiFi's preferred core when SMP; else core 0 only (ESP32-C6). */
+    const BaseType_t dsp_core = (portNUM_PROCESSORS > 1) ? (BaseType_t)1 : (BaseType_t)0;
+
     BaseType_t ret = xTaskCreatePinnedToCore(
         edge_task,
         "edge_dsp",
@@ -968,14 +1424,14 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         NULL,
         5,          /* Priority 5 — above idle, below WiFi. */
         NULL,
-        1           /* Pin to Core 1. */
-    );
+        dsp_core);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create edge DSP task");
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Edge DSP task created on Core 1 (stack=8192, priority=5)");
+    ESP_LOGI(TAG, "Edge DSP task created on core %d (stack=8192, priority=5)",
+             (int)dsp_core);
     return ESP_OK;
 }

@@ -35,7 +35,7 @@ git checkout 96b01008
 ### Step 2: Rust Workspace — Full Test Suite
 
 ```bash
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test --workspace --no-default-features
 ```
 
@@ -89,7 +89,7 @@ ls firmware/esp32-csi-node/build/*.bin 2>/dev/null || echo "App binary in build/
 ### Step 6: Verify ADR-018 Binary Frame Parser
 
 ```bash
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test -p wifi-densepose-hardware --no-default-features
 ```
 
@@ -133,7 +133,7 @@ cargo test -p wifi-densepose-train --no-default-features
 ### Step 9: Verify Python Proof System
 
 ```bash
-python v1/data/proof/verify.py
+python archive/v1/data/proof/verify.py
 ```
 
 **Expected:** PASS (hash `8c0680d7...` matches `expected_features.sha256`).
@@ -155,6 +155,25 @@ docker pull ruvnet/wifi-densepose:python
 docker inspect ruvnet/wifi-densepose:python --format='{{.Size}}'
 # Expected: ~569 MB
 ```
+
+### Step 10b: Verify CIR Deterministic Proof (ADR-134)
+
+```bash
+bash scripts/verify-cir-proof.sh
+```
+
+**Expected:** `VERDICT: PASS (CIR hash matches)` once the `cir` module is implemented.
+
+Currently outputs `BLOCKED` because `expected_cir_features.sha256` contains a placeholder.
+After the CIR implementation lands, regenerate and commit the hash:
+
+```bash
+cd v2 && cargo run -p wifi-densepose-signal --bin cir_proof_runner \
+  --release --no-default-features -- --generate-hash \
+  > ../archive/v1/data/proof/expected_cir_features.sha256
+```
+
+---
 
 ### Step 11: Verify ESP32 Flash (requires hardware on COM7)
 
@@ -212,6 +231,8 @@ Each row is independently verifiable. Status reflects audit-time findings.
 | 31 | On-device ESP32 ML inference | No | **NO** | Firmware streams raw I/Q; inference runs on aggregator |
 | 32 | Real-world CSI dataset bundled | No | **NO** | Only synthetic reference signal (seed=42) |
 | 33 | 54,000 fps measured throughput | Claimed | **NOT MEASURED** | Criterion benchmarks exist but not run at audit time |
+| 34 | CIR estimation (ADR-134, ISTA via NeumannSolver) | Yes | **PASS** | `archive/v1/data/proof/expected_cir_features.sha256`, `scripts/verify-cir-proof.sh`; regenerate after intentional changes: `cd v2 && cargo run -p wifi-densepose-signal --bin cir_proof_runner --release --no-default-features -- --generate-hash > ../archive/v1/data/proof/expected_cir_features.sha256` |
+| 35 | Empty-room baseline calibration (ADR-135, Welford + von Mises) | Yes | **PASS** | `archive/v1/data/proof/expected_calibration_features.sha256`, `scripts/verify-calibration-proof.sh`; regenerate after intentional changes: `cd v2 && cargo run -p wifi-densepose-signal --bin calibration_proof_runner --release --no-default-features -- --generate-hash > ../archive/v1/data/proof/expected_calibration_features.sha256` |
 
 ---
 
@@ -221,6 +242,8 @@ Each row is independently verifiable. Status reflects audit-time findings.
 |--------|-------|
 | Witness commit SHA | `96b01008f71f4cbe2c138d63acb0e9bc6825286e` |
 | Python proof hash (numpy 2.4.2, scipy 1.17.1) | `8c0680d7d285739ea9597715e84959d9c356c87ee3ad35b5f1e69a4ca41151c6` |
+| CIR proof hash (ADR-134) | `120bd7b1f549f57f3773971a389c48c2bdd99b4ab1f205935867a16e95583995` |
+| Calibration proof hash (ADR-135) | `d6bce07ecb1648e6936561df44bf4a3bfc17bb0ba5f692646b2301d105b52f67` |
 | ESP32 frame magic | `0xC5110001` |
 | Workspace crate version | `0.2.0` |
 

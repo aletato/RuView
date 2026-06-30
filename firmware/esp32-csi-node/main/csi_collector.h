@@ -30,6 +30,28 @@
 void csi_collector_init(void);
 
 /**
+ * Capture node_id BEFORE wifi_init_sta() or any other heavy init.
+ *
+ * Must be called from app_main() immediately after nvs_config_load().
+ * WiFi driver initialization can corrupt g_nvs_config.node_id (confirmed
+ * on device 80:b5:4e:c1:be:b8, NVS=3 but post-WiFi reads as 1).
+ * This early capture shields s_node_id from that corruption window.
+ *
+ * @param node_id Value from g_nvs_config.node_id, read right after NVS load.
+ */
+void csi_collector_set_node_id(uint8_t node_id);
+
+/**
+ * Get the runtime node_id (early capture if available, otherwise init-time).
+ *
+ * Other modules (edge_processing, wasm_runtime, display_ui) should prefer
+ * this accessor over reading g_nvs_config.node_id directly.
+ *
+ * @return Node ID (0-255) as loaded from NVS at boot.
+ */
+uint8_t csi_collector_get_node_id(void);
+
+/**
  * Serialize CSI data into ADR-018 binary frame format.
  *
  * @param info   WiFi CSI info from the ESP-IDF callback.
@@ -69,6 +91,19 @@ void csi_hop_next_channel(void);
 void csi_collector_start_hop_timer(void);
 
 /**
+ * Upgrade the promiscuous filter to capture DATA frames in addition to MGMT
+ * (RuView#893/#521).
+ *
+ * Called on display-less boards: the MGMT-only filter (the #396 display-crash
+ * workaround set in csi_collector_init) only fires the CSI callback on sparse
+ * management frames, so yield collapses to 0 pps under real traffic and the
+ * node looks dead. A board with no AMOLED panel has no QSPI/SPI-flash cache
+ * contention, so it can safely capture DATA frames — restoring abundant CSI.
+ * Display boards keep MGMT-only to avoid the #396 crash.
+ */
+void csi_collector_enable_data_capture(void);
+
+/**
  * Inject an NDP (Null Data Packet) frame for sensing.
  *
  * Uses esp_wifi_80211_tx() to send a preamble-only frame (~24 us airtime)
@@ -81,5 +116,24 @@ void csi_collector_start_hop_timer(void);
  *       null-data frame as a placeholder.
  */
 esp_err_t csi_inject_ndp_frame(void);
+
+/**
+ * Get the recent CSI callback rate (per second).
+ *
+ * Computed as a sliding 1-second window over the internal s_cb_count
+ * counter. Used by the ADR-081 radio abstraction layer to fill the
+ * pkt_yield_per_sec field of rv_radio_health_t.
+ *
+ * @return Callbacks observed in the trailing ~1 second.
+ */
+uint16_t csi_collector_get_pkt_yield_per_sec(void);
+
+/**
+ * Get the cumulative UDP send-failure counter since boot.
+ *
+ * @return Number of stream_sender_send() failures recorded by the
+ *         CSI callback path.
+ */
+uint16_t csi_collector_get_send_fail_count(void);
 
 #endif /* CSI_COLLECTOR_H */

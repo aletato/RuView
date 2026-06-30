@@ -11,7 +11,7 @@
 
 The WiFi-DensePose UI was originally built to require the full FastAPI DensePose backend (`localhost:8000`) for all functionality. This backend depends on heavy Python packages (PyTorch ~2GB, torchvision, OpenCV, SQLAlchemy, Redis) making it impractical for lightweight sensing-only deployments where the user simply wants to visualize live WiFi signal data from ESP32 CSI or Windows RSSI collectors.
 
-A Rust port exists (`rust-port/wifi-densepose-rs`) using Axum with lighter runtime footprint (~10MB binary, ~5MB RAM), but it still requires libtorch C++ bindings and OpenBLAS for compilation—a non-trivial build.
+A Rust port exists (`v2`) using Axum with lighter runtime footprint (~10MB binary, ~5MB RAM), but it still requires libtorch C++ bindings and OpenBLAS for compilation—a non-trivial build.
 
 Users need a way to run the UI with **only the sensing pipeline** active, without installing the full DensePose backend stack.
 
@@ -34,7 +34,7 @@ Implement a **sensing-only UI mode** that:
    - Breathing ring modulation when breathing-band power detected
    - Side panel with RSSI sparkline, feature meters, and classification badge
 
-4. **Python WebSocket bridge** (`v1/src/sensing/ws_server.py`) that:
+4. **Python WebSocket bridge** (`archive/v1/src/sensing/ws_server.py`) that:
    - Auto-detects ESP32 UDP CSI stream on port 5005 (ADR-018 binary frames)
    - Falls back to `WindowsWifiCollector` → `SimulatedCollector`
    - Runs `RssiFeatureExtractor` → `PresenceClassifier` pipeline
@@ -80,7 +80,7 @@ Windows WiFi RSSI ───┘         │                          │         
 ### Created
 | File | Purpose |
 |------|---------|
-| `v1/src/sensing/ws_server.py` | Python asyncio WebSocket server with auto-detect collectors |
+| `archive/v1/src/sensing/ws_server.py` | Python asyncio WebSocket server with auto-detect collectors |
 | `ui/components/SensingTab.js` | Sensing tab UI with Three.js integration |
 | `ui/components/gaussian-splats.js` | Custom GLSL Gaussian splat renderer |
 | `ui/services/sensing.service.js` | WebSocket client with reconnect + simulation fallback |

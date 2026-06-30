@@ -5,7 +5,7 @@
 | Status | Proposed |
 | Date | 2026-03-06 |
 | Deciders | ruv |
-| Depends on | ADR-012 (ESP32 CSI Mesh), ADR-039 (Edge Intelligence), ADR-040 (WASM Programmable Sensing), ADR-044 (Provisioning Enhancements), ADR-050 (Security Hardening), ADR-051 (Server Decomposition) |
+| Depends on | ADR-012 (ESP32 CSI Mesh), ADR-039 (Edge Intelligence), ADR-040 (WASM Programmable Sensing), ADR-044 (Provisioning Enhancements), ADR-166 (Security Hardening, renumbered from ADR-050), ADR-051 (Server Decomposition) |
 | Issue | [#177](https://github.com/ruvnet/RuView/issues/177) |
 
 ## Context
@@ -29,7 +29,7 @@ There is no single tool that provides a unified view of the entire deployment �
 
 A browser-based UI cannot access serial ports (for flashing), raw UDP sockets (for node discovery), or the local filesystem (for firmware binaries). A desktop application is required for hardware management. Tauri v2 is the natural choice because:
 
-1. **Rust backend** — integrates directly with the existing Rust workspace (`wifi-densepose-rs`). Crates like `wifi-densepose-hardware` (serial port parsing), `wifi-densepose-config`, and `wifi-densepose-sensing-server` can be linked as library dependencies.
+1. **Rust backend** — integrates directly with the existing Rust workspace (`v2/`). Crates like `wifi-densepose-hardware` (serial port parsing), `wifi-densepose-config`, and `wifi-densepose-sensing-server` can be linked as library dependencies.
 2. **Small binary** — Tauri bundles the system webview rather than shipping Chromium (~150 MB savings vs Electron).
 3. **Cross-platform** — Windows, macOS, Linux from the same codebase.
 4. **Security model** — Tauri's capability-based permissions system restricts frontend access to explicitly allowed Rust commands.
@@ -52,7 +52,7 @@ Build a Tauri v2 desktop application as a new crate in the Rust workspace. The f
 Add a new crate to the workspace:
 
 ```
-rust-port/wifi-densepose-rs/
+v2/
   Cargo.toml                          # Add "crates/wifi-densepose-desktop" to members
   crates/
     wifi-densepose-desktop/           # NEW — Tauri app crate
@@ -211,7 +211,7 @@ pub struct FlashProgress {
 // commands/ota.rs
 
 /// Push firmware to a node via HTTP OTA (port 8032).
-/// Includes PSK authentication per ADR-050.
+/// Includes PSK authentication per ADR-166.
 #[tauri::command]
 async fn ota_update(
     node_ip: String,
@@ -621,11 +621,11 @@ chrono = { version = "0.4", features = ["serde"] }
 ```bash
 # Prerequisites
 cargo install tauri-cli@^2
-cd rust-port/wifi-densepose-rs/crates/wifi-densepose-desktop/frontend
+cd v2/crates/wifi-densepose-desktop/frontend
 npm install
 
 # Development (hot-reload frontend + Rust rebuild)
-cd rust-port/wifi-densepose-rs/crates/wifi-densepose-desktop
+cd v2/crates/wifi-densepose-desktop
 cargo tauri dev
 
 # Production build
@@ -801,10 +801,10 @@ Total estimated effort: ~11 weeks for a single developer.
 - ADR-039: ESP32 Edge Intelligence
 - ADR-040: WASM Programmable Sensing
 - ADR-044: Provisioning Tool Enhancements
-- ADR-050: Quality Engineering — Security Hardening
+- ADR-166: Quality Engineering — Security Hardening (renumbered from ADR-050)
 - ADR-051: Sensing Server Decomposition
 - `firmware/esp32-csi-node/` — ESP32 firmware source
 - `firmware/esp32-csi-node/provision.py` — Current provisioning script
-- `rust-port/wifi-densepose-rs/crates/wifi-densepose-sensing-server/` — Sensing server
-- `rust-port/wifi-densepose-rs/crates/wifi-densepose-hardware/` — Hardware crate
+- `v2/crates/wifi-densepose-sensing-server/` — Sensing server
+- `v2/crates/wifi-densepose-hardware/` — Hardware crate
 - `ui/` — Existing web UI
