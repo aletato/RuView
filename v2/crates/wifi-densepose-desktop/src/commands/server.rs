@@ -17,7 +17,7 @@ const DEFAULT_SERVER_BIN: &str = "sensing-server";
 /// Search order:
 /// 1. Custom path from config.server_path
 /// 2. Bundled in app resources (macOS: Contents/Resources/bin/)
-/// 3. Next to the app executable
+/// 3. Next to the app executable, then the sibling cargo `target/{release,debug}/`
 /// 4. System PATH
 fn find_server_binary(app: &AppHandle, custom_path: Option<&str>) -> Result<String, String> {
     // 1. Custom path from settings
@@ -46,6 +46,27 @@ fn find_server_binary(app: &AppHandle, custom_path: Option<&str>) -> Result<Stri
             let sibling = exe_dir.join(DEFAULT_SERVER_BIN);
             if sibling.exists() {
                 return Ok(sibling.to_string_lossy().to_string());
+            }
+
+            // 3b. Cargo dev/build layout: the desktop app usually runs from
+            // `target/debug/` (or `target/release/`), but the user is told to
+            // build the server with `--release`, which lands it in the *other*
+            // profile dir. Walk up to the nearest `target/` and probe both
+            // `release/` and `debug/` so a `--release` server build is found by
+            // a `debug` desktop build (and vice versa). This is the common
+            // `tauri dev` / `cargo run` case.
+            let mut dir = Some(exe_dir);
+            while let Some(d) = dir {
+                if d.file_name().map(|n| n == "target").unwrap_or(false) {
+                    for profile in ["release", "debug"] {
+                        let candidate = d.join(profile).join(DEFAULT_SERVER_BIN);
+                        if candidate.exists() {
+                            return Ok(candidate.to_string_lossy().to_string());
+                        }
+                    }
+                    break;
+                }
+                dir = d.parent();
             }
         }
     }
